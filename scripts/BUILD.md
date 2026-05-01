@@ -71,6 +71,17 @@ chmod +x egbtheme-creator_btcr.AppImage
 ./egbtheme-creator_btcr.AppImage
 ```
 
+> **Sin FUSE instalado:** Si el sistema no tiene `libfuse.so.2` (común en distros modernas), ejecuta con:
+> ```bash
+> ./egbtheme-creator_btcr.AppImage --appimage-extract-and-run
+> ```
+> O define la variable de entorno de forma permanente:
+> ```bash
+> export APPIMAGE_EXTRACT_AND_RUN=1
+> ./egbtheme-creator_btcr.AppImage
+> ```
+> Para instalar FUSE: `sudo apt install libfuse2` (Debian/Ubuntu/Mint)
+
 > También puedes usar el botón **"Crear AppImage"** en el tab **Empaquetar** de la propia aplicación.
 
 ---

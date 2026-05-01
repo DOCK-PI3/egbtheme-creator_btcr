@@ -654,6 +654,10 @@ class AssetBrowser(QListWidget):
         self.setToolTip("Arrastra un asset al canvas para añadirlo")
         self.refresh()
 
+    def set_root(self, new_root: str):
+        self.assets_root = new_root
+        self.refresh()
+
     def refresh(self):
         self.clear()
         for rel in scan_assets(self.assets_root):
@@ -816,6 +820,8 @@ class AddViewDialog(QDialog):
 # Visual Builder Tab
 # ---------------------------------------------------------------------------
 class VisualBuilderTab(QWidget):
+    assets_root_changed = Signal(str)   # emitida cuando el usuario cambia la carpeta
+
     def __init__(self, theme_model: ThemeModel, assets_root: str):
         super().__init__()
         self.theme_model = theme_model
@@ -869,7 +875,24 @@ class VisualBuilderTab(QWidget):
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
-        lv.addWidget(QLabel("Assets disponibles:"))
+
+        # Barra de ruta de assets
+        assets_bar = QHBoxLayout()
+        assets_bar.addWidget(QLabel("Assets disponibles:"))
+        assets_bar.addStretch()
+        btn_change_assets = QToolButton()
+        btn_change_assets.setText("📁")
+        btn_change_assets.setToolTip("Cambiar carpeta de assets")
+        btn_change_assets.clicked.connect(self._change_assets_root)
+        assets_bar.addWidget(btn_change_assets)
+        lv.addLayout(assets_bar)
+
+        self._assets_path_lbl = QLabel(self.assets_root)
+        self._assets_path_lbl.setStyleSheet(
+            "color:#aaa; font-size:10px; padding:0 2px;")
+        self._assets_path_lbl.setWordWrap(True)
+        lv.addWidget(self._assets_path_lbl)
+
         self._asset_browser = AssetBrowser(self.assets_root)
         lv.addWidget(self._asset_browser, 2)
         self._elem_list = ElementListPanel()
@@ -986,6 +1009,16 @@ class VisualBuilderTab(QWidget):
             self._canvas.select_element(elem)
             self._elem_list.refresh(self._current_view)
             self._elem_list.select_elem(elem)
+
+    def _change_assets_root(self):
+        new_root = QFileDialog.getExistingDirectory(
+            self, "Seleccionar carpeta de assets", self.assets_root)
+        if new_root and new_root != self.assets_root:
+            self.assets_root = new_root
+            self._canvas.assets_root = new_root
+            self._asset_browser.set_root(new_root)
+            self._assets_path_lbl.setText(new_root)
+            self.assets_root_changed.emit(new_root)
 
 
 # ---------------------------------------------------------------------------
@@ -1326,6 +1359,7 @@ class MainWindow(QMainWindow):
 
         # Tab 2: Constructor Visual
         self._builder_tab = VisualBuilderTab(self.theme_model, self._assets_root)
+        self._builder_tab.assets_root_changed.connect(self._on_assets_root_changed)
         self._tabs.addTab(self._builder_tab, "Constructor Visual")
 
         # Tab 3: Vista Previa
@@ -1385,6 +1419,13 @@ class MainWindow(QMainWindow):
             self.theme_model.format_version = int(text)
         except ValueError:
             pass
+
+    def _on_assets_root_changed(self, new_root: str):
+        """Propaga la nueva carpeta de assets a todos los componentes."""
+        self._assets_root = new_root
+        self._preview_tab.set_assets_root(new_root)
+        self._set_tab.assets_root = new_root
+        self.statusBar().showMessage(f"Carpeta de assets: {new_root}", 6000)
 
     # ------------------------------------------------------------------
     def _on_tab_changed(self, idx: int):

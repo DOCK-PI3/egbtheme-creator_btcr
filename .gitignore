@@ -1,0 +1,40 @@
+# Entornos virtuales Python
+venv/
+.venv/
+source/
+env/
+.env/
+scripts/venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Distribuciones / builds
+dist/
+build/
+*.egg-info/
+*.egg
+
+# AppImage build artifacts
+*.AppImage
+AppDir/
+
+# Exports generados
+themes_export/
+themes_export_headless/
+
+# Editor y OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

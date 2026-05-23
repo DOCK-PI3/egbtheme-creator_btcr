@@ -1,18 +1,38 @@
 import os
 import sys
-import time
+import tempfile
 import subprocess
 
-"""
-Uso:
-updater.exe <ruta_exe_actual> <ruta_exe_nuevo>
-"""
+def main():
+    if len(sys.argv) != 3:
+        print("Uso: updater.exe <exe_actual> <exe_nuevo>")
+        sys.exit(1)
 
-exe_actual = sys.argv[1]
-exe_nuevo = sys.argv[2]
+    exe_actual = sys.argv[1]
+    exe_nuevo = sys.argv[2]
 
-time.sleep(2)  # aseguramos que el main ya cerró
+    # Crear un script batch temporal
+    bat_content = f'''@echo off
+timeout /t 2 /nobreak > nul
+move /Y "{exe_nuevo}" "{exe_actual}" > nul
+if errorlevel 1 (
+    echo Error: No se pudo reemplazar el archivo.
+    pause
+) else (
+    start "" "{exe_actual}"
+)
+del "%~f0"
+'''
+    # Guardar el batch en la carpeta temporal
+    bat_path = os.path.join(tempfile.gettempdir(), "update_script.bat")
+    with open(bat_path, "w", encoding="utf-8") as f:
+        f.write(bat_content)
 
-os.replace(exe_nuevo, exe_actual)
+    # Ejecutar el batch de forma oculta (sin ventana)
+    subprocess.Popen(
+        ["cmd.exe", "/c", bat_path],
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    )
 
-subprocess.Popen([exe_actual])
+if __name__ == "__main__":
+    main()

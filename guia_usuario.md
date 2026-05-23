@@ -10,7 +10,7 @@ Creador visual de temas para **Batocera EmulationStation** (formato `theme.xml` 
 2. [Lanzar la aplicación](#2-lanzar-la-aplicación)
 3. [Interfaz principal](#3-interfaz-principal)
 4. [Tab 1 — Editor XML](#4-tab-1--editor-xml)
-5. [Tab 2 — Constructor Visual](#5-tab-2--constructor-visual)
+5. [Tab 2 — Editor Visual](#5-tab-2--constructor-visual)
 6. [Tab 3 — Vista Previa](#6-tab-3--vista-previa)
 7. [Tab 4 — Theme Set (multi-sistema)](#7-tab-4--theme-set-multi-sistema)
 8. [Tab 5 — Empaquetar](#8-tab-5--empaquetar)
@@ -76,7 +76,7 @@ QT_QPA_PLATFORM=offscreen python3 src/main.py
 │  [Nombre del tema] [formatVersion]  [Validar] [Exportar]    │  ← Toolbar
 │  [Sistema activo: —]                                         │
 ├─────────────────────────────────────────────────────────────┤
-│  Editor XML │ Constructor Visual │ Vista Previa │ Theme Set │ Empaquetar │
+│  Editor XML │ Editor Visual │ Vista Previa │ Theme Set │ Empaquetar │
 │─────────────────────────────────────────────────────────────│
 │                                                              │
 │                    (contenido del tab activo)                │
@@ -106,7 +106,7 @@ Editor de texto con resaltado de sintaxis XML al estilo VS Code (oscuro).
 | **Generar desde modelo** | Convierte el modelo en memoria a XML y lo muestra |
 | **Aplicar al modelo** | Parsea el XML del editor y actualiza el modelo en memoria |
 
-> **Consejo**: Usa *Generar desde modelo* después de trabajar en el Constructor Visual para ver el XML resultante. Usa *Aplicar al modelo* después de editar el XML a mano para reflejar los cambios en el Constructor.
+> **Consejo**: Usa *Generar desde modelo* después de trabajar en el Editor Visual para ver el XML resultante. Usa *Aplicar al modelo* después de editar el XML a mano para reflejar los cambios en el Constructor.
 
 ### Panel derecho — `<include>`
 
@@ -125,7 +125,7 @@ Ejemplo de include generado:
 
 ---
 
-## 5. Tab 2 — Constructor Visual
+## 5. Tab 2 — Editor Visual
 
 Editor drag & drop con canvas 1280×720 px que representa las coordenadas normalizadas de Batocera (0.0 a 1.0).
 
@@ -228,7 +228,7 @@ Lista de sistemas añadidos al theme set.
 |-------|--------|
 | **+ Añadir sistema** | Muestra la lista de sistemas comunes de Batocera (snes, nes, megadrive, psx…) para añadir uno |
 | **− Eliminar** | Elimina el sistema seleccionado del theme set |
-| **Editar en constructor** | Carga el tema del sistema en el Constructor Visual para editarlo |
+| **Editar en constructor** | Carga el tema del sistema en el Editor Visual para editarlo |
 | **Copiar tema actual → sistema** | Copia el modelo activo del Constructor al sistema seleccionado |
 
 ### Panel derecho — Vista previa XML
@@ -487,7 +487,7 @@ Batocera usa valores de `0.0` a `1.0` (relativos a la pantalla):
 ```
 1. Abrir la app
 2. Escribir el nombre del tema en la toolbar
-3. Constructor Visual → "Nueva vista" → nombre: "system"
+3. Editor Visual → "Nueva vista" → nombre: "system"
 4. Añadir elemento → tipo: image → nombre: e_fondo → extra: ✓
 5. En el Inspector: path = ./bg.jpg, pos = 0.5 0.5, size = 1.0 1.0, origin = 0.5 0.5
 6. Arrastra el elemento en el canvas para reposicionarlo
@@ -502,7 +502,7 @@ Batocera usa valores de `0.0` a `1.0` (relativos a la pantalla):
 ```
 1. Editor XML → "Abrir XML" → seleccionar theme.xml
 2. Editar manualmente o pulsar "Aplicar al modelo"
-3. Ir al Constructor Visual para edición visual
+3. Ir al Editor Visual para edición visual
 4. Editor XML → "Generar desde modelo" para ver el resultado
 5. Exportar
 ```
@@ -510,7 +510,7 @@ Batocera usa valores de `0.0` a `1.0` (relativos a la pantalla):
 ### Crear un theme set multi-sistema
 
 ```
-1. Constructor Visual → diseñar el tema para "system"
+1. Editor Visual → diseñar el tema para "system"
 2. Theme Set → "+ Añadir sistema" → snes
 3. Theme Set → "Copiar tema actual → sistema"
 4. Theme Set → Seleccionar snes → "Editar en constructor"
@@ -525,7 +525,7 @@ Batocera usa valores de `0.0` a `1.0` (relativos a la pantalla):
 
 | Atajo | Acción |
 |-------|--------|
-| `Ctrl+Z` | Deshacer última acción en el Constructor Visual |
+| `Ctrl+Z` | Deshacer última acción en el Editor Visual |
 | `Ctrl+Y` / `Ctrl+Shift+Z` | Rehacer |
 | `Supr` / `Delete` | Eliminar elemento seleccionado en el canvas |
 | `Clic` en canvas | Seleccionar elemento |

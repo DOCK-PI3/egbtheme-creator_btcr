@@ -15,10 +15,59 @@ from PySide6.QtGui import (
     QPixmap, QDrag, QPainter, QPen, QColor, QBrush, QFont, QSyntaxHighlighter,
     QTextCharFormat, QAction, QIcon, QUndoStack, QUndoCommand, QPalette,
 )
-from PySide6.QtCore import Qt, QMimeData, Signal, QSize
+from PySide6.QtCore import Qt, QMimeData, Signal, QSize, QTimer
 
 from core import (ThemeModel, ThemeView, ThemeElement, ThemeSet,
                   scan_assets, validate_theme, export_theme, export_theme_set)
+
+from scripts.update_aplication import get_latest_release, hay_nueva_version, descargar_actualizacion
+
+
+# VERSIÓN DE LA APLICACIÓN
+APP_VERSION = "0.5.0"
+
+
+# Comprobar si hay actualización de la aplicación
+def comprobar_actualizaciones(parent=None):
+    try:
+        version_remota, url = get_latest_release()
+
+        if not hay_nueva_version(APP_VERSION, version_remota):
+            return
+
+        resp = QMessageBox.question(
+            parent,
+            "Actualización disponible",
+            f"Hay una nueva versión disponible:\n\n"
+            f"Actual: {APP_VERSION}\n"
+            f"Nueva: {version_remota}\n\n"
+            f"¿Quieres actualizar ahora?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if resp != QMessageBox.Yes:
+            return
+
+        nuevo_exe = descargar_actualizacion(url)
+
+        exe_actual = sys.executable
+        updater = os.path.join(os.path.dirname(sys.executable), "updater.exe")
+
+        subprocess.Popen([
+            updater,
+            exe_actual,
+            nuevo_exe
+        ])
+
+        sys.exit(0)
+
+    except Exception as e:
+        QMessageBox.warning(
+            parent,
+            "Error de actualización",
+            str(e)
+        )
+
 
 # Headless test mode
 if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -80,7 +129,7 @@ class AddElemCmd(QUndoCommand):
     def redo(self):
         if self._first:
             self._first = False
-            return   # ya insertado en el drop/add
+            return  # ya insertado en el drop/add
         if self.elem not in self.view.elements:
             self.view.elements.append(self.elem)
         self.canvas.rebuild()
@@ -450,7 +499,7 @@ class ThemeCanvas(QGraphicsView):
         self._scene.selectionChanged.connect(self._on_sel_changed)
         self._current_view: ThemeView | None = None
         self._elem_items: dict = {}
-        self._refresh_fn = None   # callback cuando drop añade elem
+        self._refresh_fn = None  # callback cuando drop añade elem
 
     def set_view(self, view: ThemeView | None):
         self._current_view = view
@@ -1333,7 +1382,7 @@ class PackageTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("egbtheme-creator  —  Batocera Theme Creator")
+        self.setWindowTitle(f"egbtheme-creator {APP_VERSION} Beta  —  Batocera Theme Creator")
         self.resize(1400, 850)
 
         self._base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1503,6 +1552,13 @@ def run_app():
     app.setPalette(palette)
     w = MainWindow()
     w.show()
+
+    # COMPROBACIÓN AUTOMÁTICA ACTUALIZACIÓN
+    QTimer.singleShot(
+        2000,  # 2 segundos después de abrir la ventana
+        lambda: comprobar_actualizaciones(w)
+    )
+
     sys.exit(app.exec())
 
 

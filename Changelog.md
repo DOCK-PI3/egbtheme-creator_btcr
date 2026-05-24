@@ -2,6 +2,17 @@
 
 ## Changelog
 
+### v0.9.0 Beta (2026-XX-XX)
+
+```bash
+- Añadido menú "Ayuda" con opciones Ver novedades, Buscar actualizaciones y Acerca de
+- FIXES:
+  + Corrección cálculo de tamaño para md_image cuando tiene minSize o maxSize. 
+    Establecido ancho y alto en 320x240 para mejor orientación
+  + Corrección de posicionamiento del elemento cuando no tiene <origin>
+  + Mejora en el cálculo de la representación (rectángulo) de "md_video" cuando usa <size>
+```
+
 ### v0.8.5 Beta (2026-05-24)
 
 ```bash

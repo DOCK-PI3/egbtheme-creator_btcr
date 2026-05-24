@@ -3,11 +3,7 @@ import os
 import re
 import darkdetect
 import shutil
-import subprocess
-import requests
-import tempfile
 from typing import List
-from packaging import version
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -16,7 +12,7 @@ from PySide6.QtWidgets import (
     QGraphicsTextItem, QFormLayout, QLineEdit, QComboBox, QCheckBox,
     QSplitter, QPlainTextEdit, QDialog, QDialogButtonBox, QMessageBox,
     QFileDialog, QScrollArea, QInputDialog, QTextEdit, QToolButton,
-    QStatusBar, QTreeView, QFileSystemModel, QStyle, QMenu, QGridLayout, QProgressDialog
+    QStatusBar, QTreeView, QFileSystemModel, QStyle, QMenu, QGridLayout, QFrame
 )
 
 from PySide6.QtGui import (
@@ -25,7 +21,7 @@ from PySide6.QtGui import (
     QFontDatabase, QFontMetrics
 )
 
-from PySide6.QtCore import Qt, QMimeData, QSize, QDir, QRectF, QPointF, QTimer, QThread, Signal, QObject, QStandardPaths
+from PySide6.QtCore import Qt, QMimeData, QSize, QDir, QRectF, QPointF, QTimer, Signal
 
 from PySide6.QtSvg import QSvgRenderer
 
@@ -33,324 +29,10 @@ from core import (ThemeModel, ThemeView, ThemeElement, ThemeSet, export_theme, e
                   ThemeVariableResolver, validate_theme_xml, ConditionalValue)
 
 from scripts.new_theme_basic import create_minimal_theme
-
-from scripts.update_aplication import get_latest_release, hay_nueva_version, descargar_actualizacion
-
+from scripts.update_aplication import parse_changelog, comprobar_actualizaciones, show_changelog_if_new
 
 # VERSIÓN DE LA APLICACIÓN
-APP_VERSION = "0.8.5"
-
-#---------------------------------------------------------
-# Comprobar si hay actualización de la aplicación
-#---------------------------------------------------------
-def comprobar_actualizaciones(parent=None):
-    try:
-        version_remota, url = get_latest_release()
-        if not hay_nueva_version(APP_VERSION, version_remota):
-            return
-
-        resp = QMessageBox.question(
-            parent,
-            "Actualización disponible",
-            f"Hay una nueva versión disponible:\n\n"
-            f"Actual: {APP_VERSION}\n"
-            f"Nueva: {version_remota}\n\n"
-            f"¿Quieres actualizar ahora?",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if resp != QMessageBox.Yes:
-            return
-
-        # Archivo temporal
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
-        temp_file.close()
-        nuevo_exe = temp_file.name
-
-        # Diálogo de progreso
-        progress_dlg = QProgressDialog("Descargando actualización... Al finalizar la descarga, se cerrará el programa. "
-                                       "\nTras la actualización, se volverá a ejecutar", "Cancelar", 0, 100, parent)
-        progress_dlg.setWindowTitle("Actualizando")
-        progress_dlg.setModal(True)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setAutoClose(False)
-        progress_dlg.setAutoReset(False)
-        progress_dlg.setMinimumSize(450, 180)
-        progress_dlg.setStyleSheet("""
-                    QProgressBar {
-                        height: 28px;
-                        border: 1px solid #555;
-                        border-radius: 6px;
-                        background-color: #1e1e1e;
-                        text-align: center;
-                        color: white;
-                        font-weight: bold;
-                    }
-                    QProgressBar::chunk {
-                        background-color: #1565C0;
-                        border-radius: 5px;
-                    }
-                    QPushButton {
-                        background-color: #d32f2f;
-                        color: white;
-                        border: none;
-                        border-radius: 4px;
-                        padding: 6px 12px;
-                    }
-                    QPushButton:hover {
-                        background-color: #f44336;
-                    }
-                """)
-
-        # Hilo y worker
-        thread = QThread()
-        worker = DownloadWorker(url, nuevo_exe)
-        worker.moveToThread(thread)
-
-        # Conectar señales
-        worker.progress.connect(progress_dlg.setValue)
-        worker.finished.connect(progress_dlg.accept)
-        worker.error.connect(progress_dlg.reject)
-        thread.started.connect(worker.run)
-        progress_dlg.canceled.connect(worker.cancel)
-        progress_dlg.canceled.connect(thread.quit)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(progress_dlg.deleteLater)  # Eliminar diálogo al terminar
-
-        thread.start()
-        result = progress_dlg.exec()
-
-        # Forzar la limpieza del hilo si aún está corriendo
-        if thread.isRunning():
-            thread.quit()
-            thread.wait(1000)
-
-        # Pequeña pausa para que la GUI se actualice
-        QApplication.processEvents()
-
-        if result == QDialog.Accepted:
-            exe_actual = sys.executable
-            updater = resource_path("updater.exe")
-            if not os.path.isfile(updater):
-                QMessageBox.critical(parent, "Error", "No se encuentra updater.exe")
-                return
-            subprocess.Popen([updater, exe_actual, nuevo_exe],
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE,
-                             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-            # Salir sin esperar
-            QApplication.quit()  # En lugar de sys.exit(0), para una salida más limpia
-            sys.exit(0)
-        else:
-            if os.path.exists(nuevo_exe):
-                os.remove(nuevo_exe)
-
-    except Exception as e:
-        QMessageBox.warning(parent, "Error de actualización", str(e))
-
-
-class DownloadWorker(QObject):
-    progress = Signal(int)       # porcentaje 0-100
-    finished = Signal(str)       # ruta del archivo descargado
-    error = Signal(str)          # mensaje de error
-
-    def __init__(self, url, dest_path):
-        super().__init__()
-        self.url = url
-        self.dest_path = dest_path
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    def run(self):
-        try:
-            response = requests.get(self.url, stream=True, timeout=30)
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            with open(self.dest_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if self._is_cancelled:
-                        f.close()
-                        os.remove(self.dest_path)
-                        self.error.emit("Descarga cancelada")
-                        return
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total_size:
-                            percent = int(downloaded * 100 / total_size)
-                            self.progress.emit(percent)
-            self.finished.emit(self.dest_path)  # Siempre al final
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-#------------------------------------------------------------------------
-# Mostrar changelog.md tras actualización del programa
-#------------------------------------------------------------------------
-def get_config_dir():
-    """Devuelve el directorio de configuración de la aplicación (para guardar last_version.txt)."""
-    if getattr(sys, 'frozen', False):
-        # Entorno empaquetado: usar directorio de configuración del usuario
-        config_dir = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
-        if not config_dir:
-            config_dir = os.path.join(os.path.expanduser("~"), ".config", "egbtheme-creator")
-    else:
-        # Desarrollo: junto al script
-        config_dir = os.path.dirname(os.path.abspath(__file__))
-
-    os.makedirs(config_dir, exist_ok=True)
-    return config_dir
-
-
-def clean_changelog_block(raw_block: str) -> str:
-    """
-    Elimina los marcadores de bloque de código (```, ```bash, etc.)
-    y convierte líneas que empiezan con '-' o '*' en viñetas '•'.
-    """
-    lines = raw_block.splitlines()
-    cleaned = []
-    in_code_block = False
-    for line in lines:
-        stripped = line.strip()
-        # Detectar inicio/fin de bloque de código
-        if stripped.startswith('```'):
-            in_code_block = not in_code_block
-            continue
-        if in_code_block:
-            # Convertir guiones o asteriscos en viñetas
-            if stripped.startswith('-') or stripped.startswith('*'):
-                bullet_line = '• ' + stripped[1:].lstrip()
-                cleaned.append(bullet_line)
-            elif stripped.strip():
-                cleaned.append(line)  # Conservar otras líneas (ej. texto normal)
-        else:
-            # Fuera de bloque de código, conservar tal cual (cabeceras, etc.)
-            cleaned.append(line)
-    return '\n'.join(cleaned)
-
-
-def parse_changelog(changelog_text: str, from_version: str) -> str:
-    """
-    Parsea el changelog en formato markdown y devuelve el texto de las versiones
-    superiores a from_version, limpiando los bloques de código.
-    """
-    lines = changelog_text.splitlines()
-    result = []
-    current_version = None
-    current_content = []
-    in_version_block = False
-    header_line = ""
-
-    # Patrón para detectar cabeceras de versión: ### v1.2.3 o ## [1.2.3]
-    version_pattern = re.compile(r'^#{2,3}\s+[vV]?(\d+\.\d+\.\d+([-\w]*))')
-
-    for line in lines:
-        stripped = line.strip()
-        m = version_pattern.match(stripped)
-        if m:
-            # Si ya estábamos acumulando una versión anterior, procesarla
-            if current_version is not None and current_content:
-                if version.parse(current_version) > version.parse(from_version):
-                    cleaned = clean_changelog_block(''.join(current_content))
-                    if cleaned:
-                        result.append(header_line)   # Cabecera de la versión
-                        result.append(cleaned)
-            # Iniciar nueva versión
-            current_version = m.group(1)
-            header_line = line   # Guardar la línea original (con formato)
-            current_content = []
-            in_version_block = True
-            continue
-
-        if in_version_block:
-            # Si encontramos otra cabecera de nivel 2 o 3 y no es de versión, terminar bloque
-            if stripped.startswith('#') and not version_pattern.match(stripped):
-                in_version_block = False
-                continue
-            current_content.append(line + '\n')
-
-    # Último bloque
-    if current_version is not None and current_content:
-        if version.parse(current_version) > version.parse(from_version):
-            cleaned = clean_changelog_block(''.join(current_content))
-            if cleaned:
-                result.append(header_line)
-                result.append(cleaned)
-
-    return '\n'.join(result).strip()
-
-
-def show_changelog_if_new():
-    """Lee el changelog desde archivo empaquetado y muestra novedades si la versión actual es más reciente que la última mostrada."""
-    # Determinar rutas
-    if getattr(sys, 'frozen', False):
-        # En ejecutable: el changelog está en sys._MEIPASS
-        base_dir = sys._MEIPASS
-    else:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    changelog_file = os.path.join(base_dir, "changelog.md")
-    last_version_file = os.path.join(get_config_dir(), "last_version.txt")
-
-    current_version = APP_VERSION
-
-    # Leer última versión mostrada
-    if os.path.exists(last_version_file):
-        with open(last_version_file, "r", encoding="utf-8") as f:
-            last_version = f.read().strip()
-    else:
-        last_version = "0.0.0"
-
-    # Solo mostrar si la versión actual es mayor y el archivo changelog existe
-    if version.parse(current_version) > version.parse(last_version) and os.path.exists(changelog_file):
-        try:
-            with open(changelog_file, "r", encoding="utf-8") as f:
-                full_changelog = f.read()
-
-            changelog_text = parse_changelog(full_changelog, last_version)
-            if not changelog_text:
-                changelog_text = "No se encontraron novedades para esta versión."
-        except Exception as e:
-            changelog_text = f"Error al leer el changelog: {e}"
-
-        # Crear diálogo personalizado
-        dlg = QDialog()
-        dlg.setWindowTitle(f"Novedades - egbtheme-creator")
-        dlg.resize(650, 500)
-        layout = QVBoxLayout(dlg)
-
-        header = QLabel(f"<h3>¡Se ha actualizado a la versión {current_version}!</h3>")
-        header.setWordWrap(True)
-        layout.addWidget(header)
-
-        text_edit = QPlainTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setPlainText(changelog_text)
-        text_edit.setStyleSheet("""
-            background: #2d2d2d;
-            color: #f0f0f0;
-            font-family: 'Consolas', 'Monaco', monospace;
-            font-size: 11px;
-        """)
-        layout.addWidget(text_edit)
-
-        btn_close = QPushButton("Cerrar")
-        btn_close.setStyleSheet(
-            "padding: 6px 12px; background: #1565C0; color: white; border: none; border-radius: 4px;")
-        btn_close.clicked.connect(dlg.accept)
-        layout.addWidget(btn_close, alignment=Qt.AlignRight)
-
-        dlg.exec()
-
-        # Guardar la versión actual para no volver a mostrar
-        with open(last_version_file, "w", encoding="utf-8") as f:
-            f.write(current_version)
-
+APP_VERSION = "0.9.0"
 
 # Headless test mode
 if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -1127,8 +809,15 @@ class CanvasElem(QGraphicsRectItem):
 
     def _get_resolved_origin(self) -> str:
         """Devuelve el origin resuelto, con fallback específico para image/video."""
-        if self.elem.element_type in ("image", "video"):
-            return self._get_resolved_property("origin", "0.5 0")
+        if self.elem.element_type == "image":
+            if self.elem.name == "logo":
+                return self._get_resolved_property("origin", "0.5 0")
+            elif self.elem.name == "md_image":
+                return self._get_resolved_property("origin", "0.5 0.5")
+            else:
+                return self._get_resolved_property("origin", "0 0")
+        elif self.elem.element_type == "video":
+            return self._get_resolved_property("origin", "0.5 0.5")
         else:
             return self._get_resolved_property("origin", "0 0")
 
@@ -1411,9 +1100,30 @@ class CanvasElem(QGraphicsRectItem):
                     self.pix_item.setPos(off_x, off_y)
             else:
                 if self.elem.element_type == "video" and self.elem.name == "md_video":
-                    # Tamaño natural por defecto para vídeos scrapeados de los juegos (md_video)
-                    # Si el vídeo tiene un path, se podría intentar obtener metadatos, pero por ahora asumimos 640x480
+                    # Tamaño natural por defecto para vídeos scrapeados de los juegos (md_video), asumimos 640x480
                     natural_w, natural_h = 640, 480
+                    # Si existe 'size', se usa como factor de escala sobre el tamaño natural
+                    if size_str:
+                        # Modo size: el elemento ocupará exactamente size (en píxeles)
+                        # El vídeo se estirará a esas dimensiones (se ignorará el aspecto)
+                        sx, sy = _parse_pos(size_str)
+                        natural_w = sx * w_scene
+                        natural_h = sy * h_scene
+                    else:
+                        # Aplicar minSize/maxSize sobre este tamaño natural (modo contain/cover)
+                        if max_w > 0 and max_h > 0:
+                            scale = min(max_w / natural_w, max_h / natural_h)
+                            natural_w *= scale
+                            natural_h *= scale
+                        if min_w > 0 and min_h > 0:
+                            scale = max(min_w / natural_w, min_h / natural_h)
+                            natural_w *= scale
+                            natural_h *= scale
+                    final_rect_w, final_rect_h = natural_w, natural_h
+                elif self.elem.element_type == "image" and self.elem.name == "md_image":
+                    # Tamaño natural por defecto para capturas scrapeadas de los juegos (md_image)
+                    # Si el vídeo tiene un path, se podría intentar obtener metadatos, pero por ahora asumimos 320x240
+                    natural_w, natural_h = 320, 240
                     # Aplicar minSize/maxSize sobre este tamaño natural (modo contain/cover)
                     if max_w > 0 and max_h > 0:
                         scale = min(max_w / natural_w, max_h / natural_h)
@@ -2069,11 +1779,13 @@ class PropertiesPanel(QWidget):
         self._new_key.setPlaceholderText("propiedad")
         self._new_val = QLineEdit()
         self._new_val.setPlaceholderText("valor")
-        btn_add = QPushButton("+")
+        self._new_val.setMaximumWidth(200)  # limita el ancho máximo del valor
+        icon_agregar = QIcon(resource_path("iconos/agregar.ico"))
+        btn_add = QPushButton(icon_agregar, "")
         btn_add.setFixedWidth(32)
         btn_add.clicked.connect(self._add_prop)
-        add_bar.addWidget(self._new_key)
-        add_bar.addWidget(self._new_val)
+        add_bar.addWidget(self._new_key, 1)
+        add_bar.addWidget(self._new_val, 0)
         add_bar.addWidget(btn_add)
         layout.addLayout(add_bar)
 
@@ -3235,6 +2947,13 @@ class MainWindow(QMainWindow):
         self.new_theme_action.setStatusTip("Crear un theme nuevo")
         self.new_theme_action.triggered.connect(self.new_theme_set)
 
+        self.view_changelog = QAction("Ver novedades...")
+        self.view_changelog.triggered.connect(self.show_changelog_dialog)
+        self.update_program = QAction("Buscar actualizaciones...")
+        self.update_program.triggered.connect(self.check_for_updates_manual)
+        self.about_action = QAction("Acerca de")
+        self.about_action.triggered.connect(self.show_about_dialog)
+
     def create_menu(self):
         menu_archivo = self.menuBar().addMenu("Archivo")
         menu_archivo.addAction(self.new_action)
@@ -3255,11 +2974,139 @@ class MainWindow(QMainWindow):
         self.show_rulers_action.triggered.connect(self._toggle_rulers)
         menu_ver.addAction(self.show_rulers_action)
 
+        menu_ayuda = self.menuBar().addMenu("Ayuda")
+        menu_ayuda.addAction(self.view_changelog)
+        menu_ayuda.addAction(self.update_program)
+        menu_ayuda.addAction(self.about_action)
+
     def new(self):
         self._xml_tab._new_xml()
 
     def open(self):
         self._xml_tab._load_file()
+
+    def show_changelog_dialog(self):
+        """Muestra el changelog completo (sin filtrar por versión)."""
+        # Determinar ruta del archivo changelog (empaquetado o desarrollo)
+
+        changelog_file = resource_path("Changelog.md")
+        if not os.path.exists(changelog_file):
+            QMessageBox.warning(self, "No encontrado", "No se encuentra el archivo de novedades.")
+            return
+
+        try:
+            with open(changelog_file, "r", encoding="utf-8") as f:
+                full_changelog = f.read()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo leer el changelog: {e}")
+            return
+
+        # Usar parse_changelog con versión base 0.0.0 para obtener el historial
+        clean_text = parse_changelog(full_changelog, "0.0.0")
+        if not clean_text:
+            clean_text = "No hay contenido de novedades."
+
+        # Diálogo personalizado
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Novedades - egbtheme-creator")
+        dlg.resize(650, 500)
+        layout = QVBoxLayout(dlg)
+
+        header = QLabel("<h3>Historial de cambios</h3>")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(clean_text)
+        text_edit.setStyleSheet("background: #2d2d2d; color: #f0f0f0; font-family: monospace;")
+        layout.addWidget(text_edit)
+
+        btn_close = QPushButton("Cerrar")
+        btn_close.setStyleSheet(
+            "padding: 6px 12px; background: #1565C0; color: white; border: none; border-radius: 4px;")
+        btn_close.clicked.connect(dlg.accept)
+        layout.addWidget(btn_close, alignment=Qt.AlignRight)
+
+        dlg.exec()
+
+    def check_for_updates_manual(self):
+        """Comprueba manualmente si hay actualizaciones y muestra mensaje si no hay."""
+        comprobar_actualizaciones(self, show_if_no_update=True, app_version=APP_VERSION, updater_path=resource_path("updater.exe"))
+
+    def show_about_dialog(self):
+        """Muestra el diálogo 'Acerca de' con información del programa (estilo Notepad++)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Acerca de egbtheme-creator")
+        dlg.setFixedSize(550, 450)
+
+        layout = QHBoxLayout(dlg)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(15)
+
+        # Icono a la izquierda (más grande)
+        icon_label = QLabel()
+        icon_path = resource_path("es_theme_editor.ico")
+        pixmap = QPixmap(icon_path) if os.path.isfile(icon_path) else QPixmap()
+        if not pixmap.isNull():
+            pixmap = pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            icon_label.setPixmap(pixmap)
+        else:
+            icon_label.setText("🎨")
+            icon_label.setFont(QFont("Segoe UI Emoji", 48))
+        layout.addWidget(icon_label, alignment=Qt.AlignTop)
+
+        # Panel derecho con toda la información
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Título
+        title = QLabel("<b>egbtheme-creator</b>")
+        title.setStyleSheet("font-size: 18px;")
+        right_layout.addWidget(title)
+
+        # Subtítulo
+        subtitle = QLabel("Batocera/Retrobat Theme Creator")
+        subtitle.setStyleSheet("color: #555; font-size: 12px; margin-bottom: 12px;")
+        right_layout.addWidget(subtitle)
+
+        # Línea separadora
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        right_layout.addWidget(line)
+
+        # Área de texto con la información (versión, autores, copyright, licencia)
+        info_text = QTextEdit()
+        info_text.setReadOnly(True)
+        info_text.setFrameShape(QFrame.NoFrame)
+        info_text.setStyleSheet("background: transparent; color: #fff; font-size: 12px;")
+        info_text.setPlainText(
+            f"Versión {APP_VERSION}\n\n"
+            "Creado por:\n"
+            "  • Mabedeep\n"
+            "  • Moriggy\n\n"
+            "© 2025-2026 egbtheme-creator\n\n"
+            "Este programa es software libre: puede redistribuirlo y/o modificarlo "
+            "bajo los términos de la Licencia Pública General de GNU, versión 3 "
+            "o cualquier versión posterior.\n\n"
+            "Este programa se distribuye CON LA ESPERANZA DE QUE SEA ÚTIL, "
+            "pero SIN NINGUNA GARANTÍA; sin siquiera la garantía implícita de "
+            "COMERCIABILIDAD o IDONEIDAD PARA UN PROPÓSITO PARTICULAR.\n\n"
+            "Véase <https://www.gnu.org/licenses/> para más detalles."
+        )
+        info_text.setMinimumHeight(160)
+        right_layout.addWidget(info_text)
+
+        # Botón OK
+        btn_ok = QPushButton("OK")
+        btn_ok.setFixedWidth(80)
+        btn_ok.clicked.connect(dlg.accept)
+        right_layout.addWidget(btn_ok, alignment=Qt.AlignRight)
+
+        layout.addWidget(right_widget, 1)
+        dlg.exec()
 
     def save(self):
         """Guarda el tema actual (modelo) en theme.xml dentro de la carpeta raíz."""
@@ -3620,12 +3467,12 @@ def run_app():
 
     # COMPROBACIÓN AUTOMÁTICA ACTUALIZACIÓN
     QTimer.singleShot(
-        2000,  # 2 segundos después de abrir la ventana
-        lambda: comprobar_actualizaciones(w)
+        1000,  # 2 segundos después de abrir la ventana
+        lambda: comprobar_actualizaciones(w, show_if_no_update=False, app_version=APP_VERSION, updater_path=resource_path("updater.exe"))
     )
 
     # Mostrar novedades si corresponde
-    show_changelog_if_new()
+    show_changelog_if_new(app_version=APP_VERSION, changelog_path=resource_path("Changelog.md"))
 
     sys.exit(app.exec())
 

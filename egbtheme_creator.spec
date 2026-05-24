@@ -12,6 +12,7 @@ a = Analysis(
         ('iconos', 'iconos'),
         ('scripts', 'scripts'),
         ('es_theme_editor.ico', '.'), # Icono de la aplicación
+        ('Changelog.md', '.'), # Changelog
     ],
     hiddenimports=[
         'requests',

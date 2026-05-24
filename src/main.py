@@ -6,7 +6,8 @@ import shutil
 import subprocess
 import requests
 import tempfile
-from typing import List, Dict
+from typing import List
+from packaging import version
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout,
@@ -14,17 +15,17 @@ from PySide6.QtWidgets import (
     QGraphicsScene, QGraphicsItem, QGraphicsRectItem, QGraphicsPixmapItem,
     QGraphicsTextItem, QFormLayout, QLineEdit, QComboBox, QCheckBox,
     QSplitter, QPlainTextEdit, QDialog, QDialogButtonBox, QMessageBox,
-    QFileDialog, QScrollArea, QGroupBox, QInputDialog, QTextEdit, QToolButton,
+    QFileDialog, QScrollArea, QInputDialog, QTextEdit, QToolButton,
     QStatusBar, QTreeView, QFileSystemModel, QStyle, QMenu, QGridLayout, QProgressDialog
 )
 
 from PySide6.QtGui import (
-    QPixmap, QDrag, QPainter, QPen, QColor, QBrush, QFont, QSyntaxHighlighter, QTransform,
-    QTextCharFormat, QIcon, QUndoStack, QUndoCommand, QAction, QKeySequence, QShortcut, QPainter,
+    QPixmap, QDrag, QPen, QColor, QBrush, QFont, QSyntaxHighlighter, QTransform,
+    QTextCharFormat, QIcon, QUndoStack, QUndoCommand, QAction, QKeySequence, QPainter,
     QFontDatabase, QFontMetrics
 )
 
-from PySide6.QtCore import Qt, QMimeData, Signal, QSize, QDir, QRectF, QPointF, QTimer, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QMimeData, QSize, QDir, QRectF, QPointF, QTimer, QThread, Signal, QObject, QStandardPaths
 
 from PySide6.QtSvg import QSvgRenderer
 
@@ -39,8 +40,9 @@ from scripts.update_aplication import get_latest_release, hay_nueva_version, des
 # VERSIÓN DE LA APLICACIÓN
 APP_VERSION = "0.8.5"
 
-
+#---------------------------------------------------------
 # Comprobar si hay actualización de la aplicación
+#---------------------------------------------------------
 def comprobar_actualizaciones(parent=None):
     try:
         version_remota, url = get_latest_release()
@@ -185,6 +187,169 @@ class DownloadWorker(QObject):
             self.finished.emit(self.dest_path)  # Siempre al final
         except Exception as e:
             self.error.emit(str(e))
+
+
+#------------------------------------------------------------------------
+# Mostrar changelog.md tras actualización del programa
+#------------------------------------------------------------------------
+def get_config_dir():
+    """Devuelve el directorio de configuración de la aplicación (para guardar last_version.txt)."""
+    if getattr(sys, 'frozen', False):
+        # Entorno empaquetado: usar directorio de configuración del usuario
+        config_dir = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
+        if not config_dir:
+            config_dir = os.path.join(os.path.expanduser("~"), ".config", "egbtheme-creator")
+    else:
+        # Desarrollo: junto al script
+        config_dir = os.path.dirname(os.path.abspath(__file__))
+
+    os.makedirs(config_dir, exist_ok=True)
+    return config_dir
+
+
+def clean_changelog_block(raw_block: str) -> str:
+    """
+    Elimina los marcadores de bloque de código (```, ```bash, etc.)
+    y convierte líneas que empiezan con '-' o '*' en viñetas '•'.
+    """
+    lines = raw_block.splitlines()
+    cleaned = []
+    in_code_block = False
+    for line in lines:
+        stripped = line.strip()
+        # Detectar inicio/fin de bloque de código
+        if stripped.startswith('```'):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            # Convertir guiones o asteriscos en viñetas
+            if stripped.startswith('-') or stripped.startswith('*'):
+                bullet_line = '• ' + stripped[1:].lstrip()
+                cleaned.append(bullet_line)
+            elif stripped.strip():
+                cleaned.append(line)  # Conservar otras líneas (ej. texto normal)
+        else:
+            # Fuera de bloque de código, conservar tal cual (cabeceras, etc.)
+            cleaned.append(line)
+    return '\n'.join(cleaned)
+
+
+def parse_changelog(changelog_text: str, from_version: str) -> str:
+    """
+    Parsea el changelog en formato markdown y devuelve el texto de las versiones
+    superiores a from_version, limpiando los bloques de código.
+    """
+    lines = changelog_text.splitlines()
+    result = []
+    current_version = None
+    current_content = []
+    in_version_block = False
+    header_line = ""
+
+    # Patrón para detectar cabeceras de versión: ### v1.2.3 o ## [1.2.3]
+    version_pattern = re.compile(r'^#{2,3}\s+[vV]?(\d+\.\d+\.\d+([-\w]*))')
+
+    for line in lines:
+        stripped = line.strip()
+        m = version_pattern.match(stripped)
+        if m:
+            # Si ya estábamos acumulando una versión anterior, procesarla
+            if current_version is not None and current_content:
+                if version.parse(current_version) > version.parse(from_version):
+                    cleaned = clean_changelog_block(''.join(current_content))
+                    if cleaned:
+                        result.append(header_line)   # Cabecera de la versión
+                        result.append(cleaned)
+            # Iniciar nueva versión
+            current_version = m.group(1)
+            header_line = line   # Guardar la línea original (con formato)
+            current_content = []
+            in_version_block = True
+            continue
+
+        if in_version_block:
+            # Si encontramos otra cabecera de nivel 2 o 3 y no es de versión, terminar bloque
+            if stripped.startswith('#') and not version_pattern.match(stripped):
+                in_version_block = False
+                continue
+            current_content.append(line + '\n')
+
+    # Último bloque
+    if current_version is not None and current_content:
+        if version.parse(current_version) > version.parse(from_version):
+            cleaned = clean_changelog_block(''.join(current_content))
+            if cleaned:
+                result.append(header_line)
+                result.append(cleaned)
+
+    return '\n'.join(result).strip()
+
+
+def show_changelog_if_new():
+    """Lee el changelog desde archivo empaquetado y muestra novedades si la versión actual es más reciente que la última mostrada."""
+    # Determinar rutas
+    if getattr(sys, 'frozen', False):
+        # En ejecutable: el changelog está en sys._MEIPASS
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    changelog_file = os.path.join(base_dir, "changelog.md")
+    last_version_file = os.path.join(get_config_dir(), "last_version.txt")
+
+    current_version = APP_VERSION
+
+    # Leer última versión mostrada
+    if os.path.exists(last_version_file):
+        with open(last_version_file, "r", encoding="utf-8") as f:
+            last_version = f.read().strip()
+    else:
+        last_version = "0.0.0"
+
+    # Solo mostrar si la versión actual es mayor y el archivo changelog existe
+    if version.parse(current_version) > version.parse(last_version) and os.path.exists(changelog_file):
+        try:
+            with open(changelog_file, "r", encoding="utf-8") as f:
+                full_changelog = f.read()
+
+            changelog_text = parse_changelog(full_changelog, last_version)
+            if not changelog_text:
+                changelog_text = "No se encontraron novedades para esta versión."
+        except Exception as e:
+            changelog_text = f"Error al leer el changelog: {e}"
+
+        # Crear diálogo personalizado
+        dlg = QDialog()
+        dlg.setWindowTitle(f"Novedades - egbtheme-creator")
+        dlg.resize(650, 500)
+        layout = QVBoxLayout(dlg)
+
+        header = QLabel(f"<h3>¡Se ha actualizado a la versión {current_version}!</h3>")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        text_edit = QPlainTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(changelog_text)
+        text_edit.setStyleSheet("""
+            background: #2d2d2d;
+            color: #f0f0f0;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 11px;
+        """)
+        layout.addWidget(text_edit)
+
+        btn_close = QPushButton("Cerrar")
+        btn_close.setStyleSheet(
+            "padding: 6px 12px; background: #1565C0; color: white; border: none; border-radius: 4px;")
+        btn_close.clicked.connect(dlg.accept)
+        layout.addWidget(btn_close, alignment=Qt.AlignRight)
+
+        dlg.exec()
+
+        # Guardar la versión actual para no volver a mostrar
+        with open(last_version_file, "w", encoding="utf-8") as f:
+            f.write(current_version)
 
 
 # Headless test mode
@@ -2319,11 +2484,16 @@ class AddElementDialog(QDialog):
             "gamecarousel": {"pos": "0.5 0.4", "size": "1.0 0.4",
                              "color": "FFFFFF", "logoSize": "0.25 0.25"},
         }
+        props = defaults.get(etype, {"pos": "0.5 0.5", "size": "0.3 0.3"}).copy()
+        # Convertir cada valor a ConditionalValue
+        converted_props = {}
+        for key, value in props.items():
+            converted_props[key] = [ConditionalValue(value, None)]
         return ThemeElement(
             name=self.name_edit.text().strip() or "e_nuevo",
             element_type=etype,
             extra=self.extra_cb.isChecked(),
-            properties=dict(defaults.get(etype, {"pos": "0.5 0.5", "size": "0.3 0.3"})),
+            properties=converted_props,
         )
 
 
@@ -3453,6 +3623,9 @@ def run_app():
         2000,  # 2 segundos después de abrir la ventana
         lambda: comprobar_actualizaciones(w)
     )
+
+    # Mostrar novedades si corresponde
+    show_changelog_if_new()
 
     sys.exit(app.exec())
 

@@ -11,8 +11,9 @@ a = Analysis(
         ('dist/updater.exe', '.'), # Incluimos el updater.exe
         ('iconos', 'iconos'),
         ('scripts', 'scripts'),
-        ('es_theme_editor.ico', '.'), # Icono de la aplicación
-        ('Changelog.md', '.'), # Changelog
+        ('es_theme_editor.ico', '.'),
+        ('egbtheme-creator.png', '.'),
+        ('Changelog.md', '.'),
     ],
     hiddenimports=[
         'requests',
@@ -38,6 +39,7 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# ---- Modo onedir: generar un directorio con todo ----
 exe = EXE(
     pyz,
     a.scripts,
@@ -52,6 +54,18 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # GUI
-    icon='es_theme_editor.ico'  # Icono de la aplicación
+    console=False,
+    icon='es_theme_editor.ico'
+)
+
+# COLLECT junta todos los archivos en una carpeta de salida
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='egbtheme-creator'   # nombre de la carpeta de salida
 )

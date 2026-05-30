@@ -4,6 +4,8 @@ import sys
 import requests
 import subprocess
 import tempfile
+import time
+import logging
 
 from PySide6.QtCore import QThread, QObject, Signal, QStandardPaths, Qt
 
@@ -12,6 +14,11 @@ from PySide6.QtWidgets import QMessageBox, QProgressDialog, QApplication, QDialo
 
 from packaging import version
 
+
+# Obtener logger (lo inicializamos una sola vez)
+logger = logging.getLogger(__name__)
+
+# Repositorio donde está alojada la aplicación
 REPO = "DOCK-PI3/egbtheme-creator_btcr"
 
 def get_latest_release():
@@ -24,7 +31,7 @@ def get_latest_release():
 
     # buscamos el exe correcto
     for asset in data["assets"]:
-        if asset["name"].lower().endswith(".exe"):
+        if asset["name"].lower().endswith(".zip"):
             return version_remote, asset["browser_download_url"]
 
     raise RuntimeError("No se encontró ningún .exe en la release")
@@ -61,20 +68,22 @@ def comprobar_actualizaciones(parent=None, show_if_no_update=False, app_version=
         if resp != QMessageBox.Yes:
             return
 
-        # Archivo temporal
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".exe")
-        temp_file.close()
-        nuevo_exe = temp_file.name
+        # Archivo temporal para el ZIP
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        temp_zip.close()
+        nuevo_zip = temp_zip.name
 
         # Diálogo de progreso
-        progress_dlg = QProgressDialog("Descargando actualización... Al finalizar la descarga, se cerrará el programa. "
-                                       "\nTras la actualización, se volverá a ejecutar", "Cancelar", 0, 100, parent)
+        fixed_msg = ("Descargando actualización... Al finalizar la descarga, se cerrará el programa.\n"
+                     "Tras la actualización, se volverá a ejecutar")
+
+        progress_dlg = QProgressDialog(fixed_msg, "Cancelar", 0, 100, parent)
         progress_dlg.setWindowTitle("Actualizando")
         progress_dlg.setModal(True)
         progress_dlg.setMinimumDuration(0)
         progress_dlg.setAutoClose(False)
         progress_dlg.setAutoReset(False)
-        progress_dlg.setMinimumSize(450, 180)
+        progress_dlg.setMinimumSize(500, 200)
         progress_dlg.setStyleSheet("""
                     QProgressBar {
                         height: 28px;
@@ -99,15 +108,50 @@ def comprobar_actualizaciones(parent=None, show_if_no_update=False, app_version=
                     QPushButton:hover {
                         background-color: #f44336;
                     }
+                    QLabel {
+                        text-align: left;
+                        qproperty-alignment: AlignLeft;
+                    }
                 """)
 
         # Hilo y worker
         thread = QThread()
-        worker = DownloadWorker(url, nuevo_exe)
+        worker = DownloadWorker(url, nuevo_zip)
         worker.moveToThread(thread)
+
+        # Función para actualizar el texto del diálogo con información detallada
+        def format_size(bytes):
+            """Convierte bytes a MB o KB para mostrar."""
+            if bytes >= 1024 * 1024:
+                return f"{bytes / (1024 * 1024):.1f} MB"
+            elif bytes >= 1024:
+                return f"{bytes / 1024:.1f} KB"
+            else:
+                return f"{bytes} B"
+
+        def format_speed(kbps):
+            """Convierte KB/s a MB/s si procede."""
+            if kbps >= 1024:
+                return f"{kbps / 1024:.1f} MB/s"
+            else:
+                return f"{kbps:.1f} KB/s"
+
+        def update_progress_text(downloaded, total, speed_kbps):
+            if total > 0:
+                percent = downloaded * 100 / total
+                info = (f"{fixed_msg}\n\n"
+                        f"Descargado: {format_size(downloaded)} de {format_size(total)} ({percent:.1f}%)\n"
+                        f"Velocidad: {format_speed(speed_kbps)}")
+            else:
+                info = (f"{fixed_msg}\n\n"
+                        f"Descargado: {format_size(downloaded)} (tamaño desconocido)\n"
+                        f"Velocidad: {format_speed(speed_kbps)}")
+            progress_dlg.setLabelText(info)
 
         # Conectar señales
         worker.progress.connect(progress_dlg.setValue)
+        worker.progress_details.connect(update_progress_text)
+
         worker.finished.connect(progress_dlg.accept)
         worker.error.connect(progress_dlg.reject)
         thread.started.connect(worker.run)
@@ -131,21 +175,20 @@ def comprobar_actualizaciones(parent=None, show_if_no_update=False, app_version=
         QApplication.processEvents()
 
         if result == QDialog.Accepted:
-            exe_actual = sys.executable
+            exe_actual = os.path.abspath(sys.argv[0])
             updater = updater_path
             if not os.path.isfile(updater):
                 QMessageBox.critical(parent, "Error", "No se encuentra updater.exe")
                 return
-            subprocess.Popen([updater, exe_actual, nuevo_exe],
+            subprocess.Popen([updater, exe_actual, nuevo_zip],
                              stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE,
                              creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             # Salir sin esperar
-            QApplication.quit()  # En lugar de sys.exit(0), para una salida más limpia
-            sys.exit(0)
+            os._exit(0)   # salida inmediata para liberar handles
         else:
-            if os.path.exists(nuevo_exe):
-                os.remove(nuevo_exe)
+            if os.path.exists(nuevo_zip):
+                os.remove(nuevo_zip)
 
     except Exception as e:
         QMessageBox.warning(parent, "Error de actualización", "No se ha podido conectar con el servidor: \n\n" + str(e))
@@ -153,6 +196,7 @@ def comprobar_actualizaciones(parent=None, show_if_no_update=False, app_version=
 
 class DownloadWorker(QObject):
     progress = Signal(int)       # porcentaje 0-100
+    progress_details = Signal(int, int, float)  # (descargado, total, velocidad_KBps)
     finished = Signal(str)       # ruta del archivo descargado
     error = Signal(str)          # mensaje de error
 
@@ -167,6 +211,7 @@ class DownloadWorker(QObject):
 
     def run(self):
         try:
+            start_time = time.time()
             response = requests.get(self.url, stream=True, timeout=30)
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
@@ -184,6 +229,11 @@ class DownloadWorker(QObject):
                         if total_size:
                             percent = int(downloaded * 100 / total_size)
                             self.progress.emit(percent)
+
+                        # Calcular velocidad (KB/s)
+                        elapsed = time.time() - start_time
+                        speed_kbps = (downloaded / 1024) / elapsed if elapsed > 0 else 0
+                        self.progress_details.emit(downloaded, total_size, speed_kbps)
             self.finished.emit(self.dest_path)  # Siempre al final
         except Exception as e:
             self.error.emit(str(e))
@@ -193,17 +243,15 @@ class DownloadWorker(QObject):
 # Mostrar changelog.md tras actualización del programa
 #------------------------------------------------------------------------
 def get_config_dir():
-    """Devuelve el directorio de configuración de la aplicación (para guardar last_version.txt)."""
+    """Devuelve el directorio de configuración de la aplicación (para guardar egbtheme-creator_version.txt)."""
     if getattr(sys, 'frozen', False):
         # Entorno empaquetado: usar directorio de configuración del usuario
-        config_dir = QStandardPaths.writableLocation(QStandardPaths.AppConfigLocation)
-        if not config_dir:
-            config_dir = os.path.join(os.path.expanduser("~"), ".config", "egbtheme-creator")
+        config_dir = os.path.dirname(sys.executable)
     else:
-        # Desarrollo: junto al script
         config_dir = os.path.dirname(os.path.abspath(__file__))
 
     os.makedirs(config_dir, exist_ok=True)
+    logger.debug(f"Directorio de configuración: {config_dir}")
     return config_dir
 
 
@@ -287,8 +335,20 @@ def parse_changelog(changelog_text: str, from_version: str) -> str:
 
 def show_changelog_if_new(app_version="", changelog_path=None):
     """Lee el changelog desde archivo empaquetado y muestra novedades si la versión actual es más reciente que la última mostrada."""
+    logger.info(f"show_changelog_if_new llamado con versión {app_version}")
+    if not changelog_path:
+        logger.warning("No se proporcionó ruta del changelog")
+        return
+    logger.debug(f"Buscando changelog en: {changelog_path}")
+    if not os.path.exists(changelog_path):
+        logger.error(f"Archivo Changelog.md no encontrado en {changelog_path}")
+        return
+
+    last_version_file = os.path.join(get_config_dir(), "egbtheme-creator_version.txt")
+    logger.debug(f"Archivo egbtheme-creator_version.txt: {last_version_file}")
+
     changelog_file = changelog_path
-    last_version_file = os.path.join(get_config_dir(), "last_version.txt")
+    last_version_file = os.path.join(get_config_dir(), "egbtheme-creator_version.txt")
 
     current_version = app_version
 
@@ -327,8 +387,8 @@ def show_changelog_if_new(app_version="", changelog_path=None):
         text_edit.setStyleSheet("""
             background: #2d2d2d;
             color: #f0f0f0;
-            font-family: 'Consolas', 'Monaco', monospace;
-            font-size: 11px;
+            font-family: 'Arial', 'Monaco', monospace;
+            font-size: 14px;
         """)
         layout.addWidget(text_edit)
 

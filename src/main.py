@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QGraphicsTextItem, QFormLayout, QLineEdit, QComboBox, QCheckBox,
     QSplitter, QPlainTextEdit, QDialog, QDialogButtonBox, QMessageBox,
     QFileDialog, QScrollArea, QInputDialog, QTextEdit, QToolButton,
-    QStatusBar, QTreeView, QFileSystemModel, QStyle, QMenu, QGridLayout, QFrame
+    QStatusBar, QTreeView, QFileSystemModel, QMenu, QGridLayout, QFrame, QListView, QAbstractItemView,
+    QProgressDialog, QProgressBar
 )
 
 from PySide6.QtGui import (
@@ -21,18 +22,23 @@ from PySide6.QtGui import (
     QFontDatabase, QFontMetrics
 )
 
-from PySide6.QtCore import Qt, QMimeData, QSize, QDir, QRectF, QPointF, QTimer, Signal
+from PySide6.QtCore import (
+    Qt, QMimeData, QSize, QDir, QRectF, QPointF, QTimer, Signal, QSortFilterProxyModel,
+    QTranslator, QLibraryInfo
+)
 
 from PySide6.QtSvg import QSvgRenderer
 
 from core import (ThemeModel, ThemeView, ThemeElement, ThemeSet, export_theme, export_theme_set,
-                  ThemeVariableResolver, validate_theme_xml, ConditionalValue)
+                  ThemeVariableResolver, validate_theme_xml, ConditionalValue, XmlNode)
 
 from scripts.new_theme_basic import create_minimal_theme
 from scripts.update_aplication import parse_changelog, comprobar_actualizaciones, show_changelog_if_new
+from logger_config import setup_logger, install_global_hooks, ExceptionAwareApplication
 
 # VERSIÓN DE LA APLICACIÓN
 APP_VERSION = "0.9.0"
+
 
 # Headless test mode
 if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
@@ -372,6 +378,7 @@ class ResizeElemCmd(QUndoCommand):
 # ---------------------------------------------------------------------------
 class XMLEditorTab(QWidget):
     model_changed = Signal()
+    file_loaded = Signal() # Archivo cargado
 
     def __init__(self, theme_model: ThemeModel):
         super().__init__()
@@ -406,6 +413,7 @@ class XMLEditorTab(QWidget):
         left_layout.addLayout(button_bar)
 
         self.tree_view = QTreeView()
+        self.tree_view.setIconSize(QSize(32, 32))  # Tamaño del icono (ancho, alto)
         self.tree_view.setHeaderHidden(True)
         self.tree_view.setAnimated(True)
         self.tree_view.setIndentation(10)
@@ -467,7 +475,7 @@ class XMLEditorTab(QWidget):
                 main_window._assets_root = folder
                 main_window._builder_tab.assets_root = folder
                 main_window._builder_tab._canvas.assets_root = folder
-                main_window._builder_tab._asset_browser.set_root(folder)
+                main_window._builder_tab.theme_assets_browser.set_root(folder)
                 main_window._builder_tab._assets_path_lbl.setText(folder)
                 main_window._builder_tab.assets_root_changed.emit(folder)
                 main_window._preview_tab.set_assets_root(folder)
@@ -501,7 +509,20 @@ class XMLEditorTab(QWidget):
                 main_window._name_edit.setText(main_window.theme_model.name)
 
             self._update_create_folder_button_state() # Habilitar botón de crear carpeta
+            main_window._update_actions_state()  # Habilitar guardado y nuevo xml
+            main_window._update_undo_redo_state() # Conectar estado botones "Deshacer" y "Rehacer"
+
+            # Resetear banderas de la opción "Guardar" y limpiar pila de cambios
+            main_window._changes_unsaved = False
+            main_window._update_save_action_state()
+            main_window._builder_tab._undo_stack.clear()
+            main_window._builder_tab._undo_stack.setClean()
+            main_window._editing_system_from_set = None
+            main_window._theme_set_modified = False
+            main_window._saved_model_xml = main_window.theme_model.to_xml()
+
             self._show_status(f"Theme cargado: {folder}")
+            self.file_loaded.emit()  # Emitir señal de archivo cargado
 
     def on_tree_double_click(self, index):
         file_path = self.file_model.filePath(index)
@@ -510,9 +531,14 @@ class XMLEditorTab(QWidget):
                 self.editor.setPlainText(f.read())
                 self.current_file_path = file_path
             self._show_status(f"Archivo cargado: {file_path}")
-            self._apply_to_model()  # una sola llamada
+            if self._apply_to_model():  # si la aplicación fue exitosa
+                self.file_loaded.emit()  # notificar que se ha cargado un nuevo archivo
 
     def refresh_from_model(self):
+        if self.theme_model is None:
+            self.editor.setPlainText("")
+            self.status_lbl.setText("No hay ningún theme cargado. Importa o crea uno.")
+            return
         self.editor.setPlainText(self.theme_model.to_xml())
 
     def _new_xml(self):
@@ -575,23 +601,11 @@ class XMLEditorTab(QWidget):
                 self.tree_view.scrollTo(idx)
 
             # 7. Aplicarlo al modelo automáticamente
-            self._apply_to_model()
+            if self._apply_to_model():
+                self.file_loaded.emit()  # Emitir señal de archivo cargado
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"No se pudo crear el archivo:\n{str(e)}")
-
-    def _load_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Abrir XML", os.getcwd(), "XML files (*.xml);;All (*)")
-        if path:
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.editor.setPlainText(f.read())
-                    self.current_file_path = path  # Guardar ruta del archivo XML
-                self._show_status(f"Cargado: {path}")
-                self._apply_to_model()
-            except Exception as e:
-                self._show_status(f"Error: {e}")
 
     def _save_file(self):
         """Guardar como... (solicita nueva ruta)"""
@@ -620,21 +634,24 @@ class XMLEditorTab(QWidget):
         else:
             self._save_file()  # Si no hay ruta, hacer "Guardar como"
 
-    def _apply_to_model(self):
+    def _apply_to_model(self) -> bool:
         xml = self.editor.toPlainText().strip()
         if not xml:
             self.status_lbl.setText("El editor está vacío.")
             self.status_lbl.setStyleSheet("color:#f88; padding:4px;")
             QMessageBox.warning(self, "Editor vacío", "No hay contenido XML para validar.")
-            return
+            return False
 
         new_model = ThemeModel.from_xml(xml)
+        if not new_model:
+            return False
+
         if new_model is None:
             self.status_lbl.setText("XML inválido (error de sintaxis).")
             self.status_lbl.setStyleSheet("color:#f88; padding:4px;")
             QMessageBox.critical(self, "Error de sintaxis",
                                  "El XML no es válido.\nVerifica caracteres como &, <, >, o etiquetas mal cerradas.")
-            return
+            return False
 
         # 1. Validación estructural del XML (texto suelto, etiquetas permitidas)
         xml_errors = validate_theme_xml(new_model)
@@ -642,16 +659,47 @@ class XMLEditorTab(QWidget):
             self.status_lbl.setText("Estructura XML incorrecta.")
             self.status_lbl.setStyleSheet("color:#f88; padding:4px;")
             QMessageBox.warning(self, "Errores estructurales", "\n".join(xml_errors))
-            return
+            return False
 
-        # Aplicar cambios solo si pasa todas las validaciones
-        self.theme_model.views = new_model.views
+        # --- ACTUALIZAR MODELO EXISTENTE SIN ROMPER REFERENCIAS ---
+        # Copiar atributos simples
         self.theme_model.includes = new_model.includes
         self.theme_model.format_version = new_model.format_version
+        self.theme_model.variables = new_model.variables.copy()
+        self.theme_model.subsets = new_model.subsets.copy()
+        self.theme_model.root_attrib = new_model.root_attrib.copy()
+        self.theme_model.xml_declaration = new_model.xml_declaration
         self.theme_model.raw_xml = new_model.raw_xml
+
+        # Actualizar las vistas: reutilizar objetos existentes por nombre
+        old_views_by_name = {v.name: v for v in self.theme_model.views}
+        new_views_by_name = {v.name: v for v in new_model.views}
+
+        # 1. Eliminar vistas que ya no existen en el nuevo modelo
+        for name in list(old_views_by_name.keys()):
+            if name not in new_views_by_name:
+                self.theme_model.views.remove(old_views_by_name[name])
+
+        # 2. Actualizar vistas existentes o añadir nuevas
+        for name, new_view in new_views_by_name.items():
+            if name in old_views_by_name:
+                # Actualizar la vista existente (misma referencia)
+                old_view = old_views_by_name[name]
+                old_view.inherits = new_view.inherits
+                old_view.is_custom = new_view.is_custom
+                old_view.elements = new_view.elements  # Reemplaza la lista
+            else:
+                # Añadir vista nueva
+                self.theme_model.views.append(new_view)
+
         self.status_lbl.setText("XML VALIDADO. Vista actualizada correctamente.")
         self.status_lbl.setStyleSheet("color:#8f8; padding:4px;")
         self.model_changed.emit()
+
+        main_window = self.window()
+        if hasattr(main_window, '_builder_tab'):
+            main_window._builder_tab._undo_stack.clear()
+            main_window._builder_tab._undo_stack.setClean()
 
         # Ventana informativa de éxito
         QMessageBox.information(self, "Validación exitosa", "El XML es correcto y se ha aplicado la vista.")
@@ -660,6 +708,8 @@ class XMLEditorTab(QWidget):
         main_window = self.window()
         if hasattr(main_window, '_name_edit'):
             main_window._name_edit.setText(self.theme_model.name)
+
+        return True
 
     def _create_folder(self):
         """Crea una nueva carpeta en el directorio actualmente seleccionado del árbol."""
@@ -991,11 +1041,19 @@ class CanvasElem(QGraphicsRectItem):
 
         # --- Para elementos de imagen/vídeo ---
         if self.elem.element_type in ("image", "video"):
-            path_val = self._get_resolved_property("path", "")
-            default_val = self._get_resolved_property("default", "") if "default" in self.elem.properties else ""
-            pix = self._load_asset_pixmap(path_val, None, None)
-            if pix is None and default_val:
-                pix = self._load_asset_pixmap(default_val, None, None)
+            # Obtener lista de rutas .svg o .png
+            paths = self._get_resolved_paths()
+            pix = None
+            for rel_path in paths:
+                pix = self._load_asset_pixmap(rel_path, None, None)
+                if pix is not None:
+                    break
+
+            # Si ninguna ruta funcionó, probar con "default"
+            if pix is None:
+                default_val = self._get_resolved_property("default", "")
+                if default_val:
+                    pix = self._load_asset_pixmap(default_val, None, None)
 
             if pix is not None:
                 img_w, img_h = pix.width(), pix.height()
@@ -1036,10 +1094,6 @@ class CanvasElem(QGraphicsRectItem):
                     off_y = (target_h - new_h) / 2
                 else:
                     # CASO SIN size: el elemento toma el tamaño del asset limitado por min/max
-                    pix = self._load_asset_pixmap(path_val, None, None)
-                    if pix is None and default_val:
-                        pix = self._load_asset_pixmap(default_val, None, None)
-
                     if pix is not None:
                         img_w, img_h = pix.width(), pix.height()
                         # Aplicar maxSize (contain) y minSize (cover) manteniendo aspecto
@@ -1204,6 +1258,14 @@ class CanvasElem(QGraphicsRectItem):
         off_y = (target_h - new_h) / 2
         return new_w, new_h, off_x, off_y
 
+    def _get_resolved_paths(self) -> List[str]:
+        """Devuelve la lista de rutas de imagen/video resueltas (con variables) en orden."""
+        context = {"system.theme": self.canvas_system}
+        # Añadir también las variables globales del tema
+        context.update(self.canvas_vars)
+        paths = self.elem.get_resolved_values("path", context)
+        return paths
+
     def _load_asset_pixmap(self, rel_path, target_w=None, target_h=None):
         """Carga un QPixmap. Si target_w/target_h son None, carga tamaño original.
            Para SVG, si no se da tamaño, usa el tamaño por defecto del renderer."""
@@ -1213,6 +1275,14 @@ class CanvasElem(QGraphicsRectItem):
             abs_path = os.path.join(self.assets_root, rel_path[2:])
         else:
             abs_path = rel_path
+
+        # Obtener el canvas y su caché
+        canvas = self.get_canvas()
+        cache = canvas._pixmap_cache if canvas else {}
+        cache_key = (abs_path, target_w, target_h)
+        if cache_key in cache:
+            return cache[cache_key]
+
         ext = os.path.splitext(abs_path)[1].lower()
         if ext == '.svg':
             renderer = QSvgRenderer(abs_path)
@@ -1227,12 +1297,15 @@ class CanvasElem(QGraphicsRectItem):
                 painter = QPainter(pix)
                 renderer.render(painter)
                 painter.end()
+                cache[cache_key] = pix  # guardar en caché
                 return pix
             return None
         else:
             pix = QPixmap(abs_path)
             if not pix.isNull():
+                cache[cache_key] = pix
                 return pix
+
         # Fallback (búsqueda en el mismo directorio) - opcional
         dirname = os.path.dirname(abs_path)
         if os.path.isdir(dirname):
@@ -1259,6 +1332,10 @@ class CanvasElem(QGraphicsRectItem):
                         pix = QPixmap(fallback_path)
                         if not pix.isNull():
                             return pix
+
+        if pix is not None and not pix.isNull():
+            cache[cache_key] = pix
+            return pix
         return None
 
 class TextCanvasElem(CanvasElem):
@@ -1508,6 +1585,7 @@ class ThemeCanvas(QGraphicsView):
         self._refresh_fn = None  # callback cuando drop añade elem
         self.current_system = ""
         self.current_variables = {}
+        self._pixmap_cache = {}
         self.rulers_visible = show_rulers  # <- control de visibilidad
 
     # --------------------------------------------------------------
@@ -1672,13 +1750,13 @@ class ThemeCanvas(QGraphicsView):
             "path": [ConditionalValue(f"./{rel_path}", None)],
             "pos": [ConditionalValue(f"{sp.x() / CANVAS_W:.4f} {sp.y() / CANVAS_H:.4f}", None)],
             "size": [ConditionalValue("0.5 0.5", None)],
-            "origin": [ConditionalValue("0.5 0.5", None)],
+            "zIndex": [ConditionalValue("", None)],
         }
 
         elem = ThemeElement(
             name=f"e_{os.path.splitext(os.path.basename(rel_path))[0]}",
-            element_type=etype,
-            extra=True,
+            tag=etype,
+            extra=False,
             properties=properties,
         )
         self._current_view.elements.append(elem)
@@ -1686,6 +1764,7 @@ class ThemeCanvas(QGraphicsView):
                           system_name=self.current_system,
                           variables=self.current_variables)
         self._scene.addItem(item)
+        item.update_geometry()
         self._elem_items[id(elem)] = item
         event.acceptProposedAction()
         self.element_selected.emit(elem)
@@ -1693,6 +1772,9 @@ class ThemeCanvas(QGraphicsView):
             cmd = AddElemCmd(self._current_view, elem, self,
                              refresh_fn=self._refresh_fn)
             self._undo_stack.push(cmd)
+            # Refrescar listado de "Elementos en la vista"
+            if self._refresh_fn:
+                self._refresh_fn()
 
     def move_element(self, elem: ThemeElement, new_pos_norm: str, old_pos_norm: str, push_undo=True):
         """Mueve un elemento visualmente y actualiza su propiedad 'pos'. Si push_undo es True, crea un comando."""
@@ -1749,6 +1831,7 @@ class PropertiesPanel(QWidget):
     def __init__(self, undo_stack=None):
         super().__init__()
         self._undo_stack = undo_stack
+        self._refresh_elem_list = None # callback para refrescar la lista de elementos
         self._elem: ThemeElement | None = None
         self._rows: dict = {}
         self._canvas_ref = None
@@ -1776,9 +1859,10 @@ class PropertiesPanel(QWidget):
         add_bar = QHBoxLayout()
         self._new_key = QComboBox()
         self._new_key.setEditable(True)  # permite escribir cualquier propiedad
-        self._new_key.setPlaceholderText("propiedad")
+        self._new_key.lineEdit().setPlaceholderText("Propiedad")
+        self._new_key.setCurrentIndex(-1)  # Ningún ítem seleccionado al inicio
         self._new_val = QLineEdit()
-        self._new_val.setPlaceholderText("valor")
+        self._new_val.setPlaceholderText("Valor")
         self._new_val.setMaximumWidth(200)  # limita el ancho máximo del valor
         icon_agregar = QIcon(resource_path("iconos/agregar.ico"))
         btn_add = QPushButton(icon_agregar, "")
@@ -1799,28 +1883,69 @@ class PropertiesPanel(QWidget):
         self._elem = elem
         self._canvas_ref = canvas
         self._rows.clear()
+        # Limpiar el formulario (todas las filas)
         while self._form.rowCount():
             self._form.removeRow(0)
+
         if elem is None:
             self._name_edit.setText("")
             self._type_lbl.setText("Tipo: -")
             self._extra_cb.setChecked(False)
             self._new_key.clear()
             return
+
         self._name_edit.setText(elem.name)
         self._type_lbl.setText(f"Tipo: {elem.element_type}")
         self._extra_cb.setChecked(elem.extra)
 
-        # Mostrar SOLO las propiedades que ya tienen valor
+        # Crear una fila por cada propiedad existente
         for prop, cv_list in elem.properties.items():
             base_val = elem.get_base_value(prop)
+
+            # Widgets de la fila: QLineEdit + botón eliminar
             edit = QLineEdit(base_val)
             edit.setPlaceholderText(prop)
-            self._form.addRow(prop + ":", edit)
+            icon_menos = QIcon(resource_path("iconos/menos.ico"))
+            delete_btn = QPushButton(icon_menos, "")
+            delete_btn.setFixedSize(24, 24)
+            delete_btn.setToolTip(f"Eliminar propiedad '{prop}'")
+
+            # Conectar el botón con la propiedad actual (usando lambda con argumento por defecto)
+            delete_btn.clicked.connect(lambda checked, p=prop: self._delete_property(p))
+
+            # Layout horizontal para alinear el edit y el botón
+            row_layout = QHBoxLayout()
+            row_layout.addWidget(edit, 1)   # el edit se expande
+            row_layout.addWidget(delete_btn)
+
+            # Añadir la fila al formulario
+            self._form.addRow(prop + ":", row_layout)
             self._rows[prop] = edit
 
-        # Actualizar el combo con las propiedades sugeridas que faltan
         self._update_combo_options()
+
+    def set_refresh_callback(self, callback):
+        self._refresh_elem_list = callback
+
+    def _delete_property(self, prop_name: str):
+        if not self._elem:
+            return
+        nodes = self._elem.get_property_nodes(prop_name)
+        if not nodes:
+            QMessageBox.warning(self, "Error", f"No se encontró la propiedad '{prop_name}' para eliminar.")
+            return
+        reply = QMessageBox.question(
+            self, "Eliminar propiedad",
+            f"¿Eliminar la propiedad '{prop_name}'?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        cmd = DeletePropCommand(self._elem, prop_name, self, self._canvas_ref, self._refresh_elem_list)
+        if self._undo_stack:
+            self._undo_stack.push(cmd)
+        else:
+            cmd.redo()
 
     def _update_combo_options(self):
         """Actualiza el QComboBox con las propiedades sugeridas que aún no tiene el elemento."""
@@ -1843,7 +1968,7 @@ class PropertiesPanel(QWidget):
         key = self._new_key.currentText().strip()
         val = self._new_val.text()
         if key and self._elem:
-            # Si la clave ya existe, preguntar si sobrescribir (opcional)
+            # Si la clave ya existe, preguntar si sobrescribir
             if key in self._elem.properties:
                 reply = QMessageBox.question(
                     self, "Propiedad existente",
@@ -1852,15 +1977,12 @@ class PropertiesPanel(QWidget):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # Crear una nueva propiedad sin condición
-            cv = ConditionalValue(val, None)
-            self._elem.properties[key] = [cv]
-            # Refrescar el panel para mostrar la nueva propiedad y actualizar combo
+            # Añadir o actualizar la propiedad correctamente
+            self._elem.set_base_value(key, val)
+            # Refrescar el panel y el canvas
             self.set_element(self._elem, self._canvas_ref)
-            # Emitir cambio para que el canvas se actualice
             self.properties_changed.emit()
             self._new_val.clear()
-            # Opcional: dejar el combo sin selección
             self._new_key.setCurrentIndex(-1)
 
     def _apply(self):
@@ -1874,140 +1996,146 @@ class PropertiesPanel(QWidget):
             new_val = edit.text().strip()
             if new_val:
                 self._elem.set_base_value(prop, new_val)
-            # Si el usuario borra el texto, no hacemos nada (podría ser eliminar, pero mejor no)
+
         self.set_element(self._elem, self._canvas_ref)
         self.properties_changed.emit()
         self._update_combo_options()
 
 
-# ---------------------------------------------------------------------------
-# Folder Asset Browser
-# ---------------------------------------------------------------------------
-class FolderAssetBrowser(QListWidget):
-    """Navegador de assets con soporte de subcarpetas, añadir y borrar."""
+class DeletePropCommand(QUndoCommand):
+    def __init__(self, elem, prop_name, panel, canvas, refresh_elem_list):
+        super().__init__(f"Eliminar propiedad '{prop_name}'")
+        self.elem = elem
+        self.prop_name = prop_name
+        self.panel = panel
+        self.canvas = canvas
+        self.refresh_elem_list = refresh_elem_list
+        # Guardar copia de los nodos eliminados (serializados a dict)
+        self.old_nodes_data = [node.to_dict() for node in elem.get_property_nodes(prop_name)]
 
+    def redo(self):
+        self.elem.delete_property_nodes(self.prop_name)
+        self._refresh()
+
+    def undo(self):
+        # Reconstruir nodos desde los datos guardados
+        for node_data in self.old_nodes_data:
+            node = XmlNode.from_dict(node_data)
+            self.elem.children.append(node)
+        self._refresh()
+
+    def _refresh(self):
+        # Actualizar el panel (recarga el elemento)
+        self.panel.set_element(self.elem, self.canvas)
+        self.panel.properties_changed.emit()
+        # Actualizar el canvas visual
+        self.canvas.rebuild()
+        if self.refresh_elem_list:
+            self.refresh_elem_list()
+
+
+# ---------------------------------------------------------------------------
+# Folder Asset Browser e Internal Asset Browser
+# ---------------------------------------------------------------------------
+class FolderAssetBrowser(QListView):
     def __init__(self, assets_root: str):
         super().__init__()
-        self.assets_root = os.path.abspath(assets_root)
-        self.current_dir = self.assets_root
+        # Normalizar desde el principio
+        self.base_assets_root = os.path.normpath(os.path.abspath(assets_root))
+        self.current_dir = self.base_assets_root
+
+        self.setIconSize(QSize(48, 48))
+        self.setDragDropMode(QAbstractItemView.DragOnly)
         self.setDragEnabled(True)
-        self.setIconSize(QSize(48, 48))  # Tamaño de icono un poco más grande
-        self.setToolTip("Doble clic en carpeta para entrar, arrastra archivos al canvas")
-        self.itemDoubleClicked.connect(self._on_double_click)
-        self.refresh()
+        self.setAcceptDrops(False)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setViewMode(QListView.IconMode)
+        self.setMovement(QListView.Static)
+        self.setResizeMode(QListView.Adjust)
+        self.setGridSize(QSize(80, 80))
+        self.setWordWrap(True)
+
+        # Modelo con raíz base
+        self.model = ThumbnailFileSystemModel()
+        self.model.setRootPath(self.base_assets_root)
+        self.model.setFilter(QDir.Dirs | QDir.Files | QDir.NoDotAndDotDot)
+
+        self.proxy = AssetFilterProxyModel()
+        self.proxy.setSourceModel(self.model)
+        self.setModel(self.proxy)
+
+        self._update_root_index()
+        self.doubleClicked.connect(self._on_double_click)
+
+    def _normalize(self, path: str) -> str:
+        """Convierte a ruta normalizada absoluta."""
+        return os.path.normpath(os.path.abspath(path))
+
+    def _update_root_index(self):
+        """Actualiza el rootIndex de la vista según current_dir."""
+        if not os.path.isdir(self.current_dir):
+            return
+        src_idx = self.model.index(self.current_dir)
+        if not src_idx.isValid():
+            # Forzar recarga del modelo
+            self.model.setRootPath(self.base_assets_root)
+            src_idx = self.model.index(self.current_dir)
+        if src_idx.isValid():
+            self.setRootIndex(self.proxy.mapFromSource(src_idx))
+        else:
+            # Fallback a la raíz base
+            src_idx = self.model.index(self.base_assets_root)
+            if src_idx.isValid():
+                self.setRootIndex(self.proxy.mapFromSource(src_idx))
 
     def set_root(self, new_root: str):
-        self.assets_root = os.path.abspath(new_root)
-        self.current_dir = self.assets_root
-        self.refresh()
+        """Cambia la raíz BASE (cuando se cambia la carpeta de assets)."""
+        self.base_assets_root = self._normalize(new_root)
+        self.model.setRootPath(self.base_assets_root)
+        self.current_dir = self.base_assets_root
+        self._update_root_index()
 
     def go_up(self):
-        """Subir al directorio padre."""
+        """Subir al directorio padre (si no se sale de la raíz base)."""
         parent = os.path.dirname(self.current_dir)
-        if parent and parent != self.current_dir and os.path.exists(parent):
-            # No permitir salir de la raíz de assets
-            if os.path.commonpath([parent, self.assets_root]) == self.assets_root:
-                self.current_dir = parent
-                self.refresh()
-            else:
-                # Si estamos en la raíz, no subir
+        if not parent:
+            return
+        norm_parent = self._normalize(parent)
+        norm_current = self._normalize(self.current_dir)
+        norm_base = self.base_assets_root
+        if norm_parent != norm_current:
+            # Verificar que el padre sigue dentro de la base
+            try:
+                common = os.path.commonpath([norm_base, norm_parent])
+                if common == norm_base:
+                    self.current_dir = norm_parent
+                    self._update_root_index()
+            except ValueError:
                 pass
 
     def go_root(self):
-        """Volver a la raíz de assets."""
-        self.current_dir = self.assets_root
-        self.refresh()
+        """Volver a la raíz base."""
+        self.current_dir = self.base_assets_root
+        self._update_root_index()
 
     def refresh(self):
-        self.clear()
-        if not os.path.isdir(self.current_dir):
-            return
+        """Refresca la vista recargando el modelo."""
+        self.model.setRootPath(self.base_assets_root)
+        self._update_root_index()
 
-        # Orden: primero carpetas, luego archivos (alfabético)
-        entries = []
-        try:
-            for name in os.listdir(self.current_dir):
-                full = os.path.join(self.current_dir, name)
-                if name.startswith('.'):
-                    continue
-                entries.append((name, full))
-        except OSError:
-            return
-
-        # Separar carpetas y archivos soportados
-        folders = []
-        files = []
-        for name, full in entries:
-            if os.path.isdir(full):
-                folders.append((name, full))
-            else:
-                ext = os.path.splitext(name)[1].lower()
-                # Mostrar imágenes, vídeos, audios y fuentes
-                if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg',
-                           '.mp4', '.mkv', '.avi',
-                           '.wav', '.ogg', '.mp3',
-                           '.ttf', '.TTF', '.otf'):
-                    files.append((name, full))
-
-        folders.sort(key=lambda x: x[0].lower())
-        files.sort(key=lambda x: x[0].lower())
-
-        # Añadir carpetas
-        folder_icon = self.style().standardIcon(QStyle.SP_DirIcon)
-        for name, full in folders:
-            rel_path = os.path.relpath(full, self.assets_root).replace('\\', '/')
-            item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, ("dir", rel_path, full))
-            item.setIcon(folder_icon)
-            self.addItem(item)
-
-        # Añadir archivos con su miniatura
-        for name, full in files:
-            rel_path = os.path.relpath(full, self.assets_root).replace('\\', '/')
-            item = QListWidgetItem(name)
-            item.setData(Qt.UserRole, ("file", rel_path, full))
-            # Generar miniatura solo si es imagen/vídeo (opcional)
-            ext = os.path.splitext(name)[1].lower()
-            if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp'):
-                pix = QPixmap(full)
-                if not pix.isNull():
-                    icon = QIcon(pix.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    item.setIcon(icon)
-            elif ext == '.svg':
-                # Generar una miniatura a partir del SVG (tamaño 48x48)
-                renderer = QSvgRenderer(full)
-                if renderer.isValid():
-                    pixmap = QPixmap(48, 48)
-                    pixmap.fill(Qt.transparent)
-                    painter = QPainter(pixmap)
-                    renderer.render(painter)
-                    painter.end()
-                    item.setIcon(QIcon(pixmap))
-            elif ext in ('.mp4', '.mkv', '.avi'):
-                item.setIcon(QIcon.fromTheme("video-x-generic"))
-            elif ext in ('.wav', '.ogg', '.mp3'):
-                item.setIcon(QIcon.fromTheme("audio-x-generic"))
-            elif ext in ('.ttf', '.TTF', '.otf'):
-                item.setIcon(QIcon.fromTheme("font-x-generic"))
-            else:
-                item.setIcon(QIcon.fromTheme("text-x-generic"))
-            self.addItem(item)
+    def get_current_dir(self) -> str:
+        return self.current_dir
 
     def add_item(self, button=None):
-        """Añade archivos o carpeta en el directorio actual.
-        Si se pasa un botón, el menú aparece junto a él."""
+        current_dir = self.current_dir
+        if not os.path.isdir(current_dir):
+            QMessageBox.warning(self, "Sin directorio", "No se puede determinar el directorio actual.")
+            return
         menu = QMenu(self)
         action_file = menu.addAction("Añadir archivo(s)")
         action_folder = menu.addAction("Añadir carpeta")
-
-        # Determinar la posición para mostrar el menú
-        if button:
-            pos = button.mapToGlobal(button.rect().bottomLeft())
-        else:
-            pos = self.mapToGlobal(self.rect().bottomLeft())
-
+        pos = button.mapToGlobal(button.rect().bottomLeft()) if button else self.mapToGlobal(self.rect().bottomLeft())
         action = menu.exec(pos)
-
         if action == action_file:
             files, _ = QFileDialog.getOpenFileNames(
                 self, "Seleccionar archivos", "",
@@ -2018,14 +2146,14 @@ class FolderAssetBrowser(QListWidget):
             )
             if files:
                 for src in files:
-                    dst = os.path.join(self.current_dir, os.path.basename(src))
+                    dst = os.path.join(current_dir, os.path.basename(src))
                     if not os.path.exists(dst):
                         shutil.copy2(src, dst)
                 self.refresh()
         elif action == action_folder:
             name, ok = QInputDialog.getText(self, "Nueva carpeta", "Nombre de la carpeta:")
             if ok and name.strip():
-                new_dir = os.path.join(self.current_dir, name.strip())
+                new_dir = os.path.join(current_dir, name.strip())
                 if not os.path.exists(new_dir):
                     os.makedirs(new_dir)
                     self.refresh()
@@ -2033,58 +2161,93 @@ class FolderAssetBrowser(QListWidget):
                     QMessageBox.warning(self, "Ya existe", f"La carpeta '{name}' ya existe.")
 
     def delete_item(self):
-        """Elimina el elemento seleccionado (archivo o carpeta) pidiendo confirmación."""
-        current = self.currentItem()
-        if not current:
+        selected = self.selectedIndexes()
+        if not selected:
             QMessageBox.warning(self, "Sin selección", "Selecciona un elemento para borrar.")
             return
-        data = current.data(Qt.UserRole)
-        if not data:
+        idx = selected[0]
+        src_idx = self.proxy.mapToSource(idx)
+        path = self.model.filePath(src_idx)
+        if not path:
             return
-        kind, rel_path, full_path = data
-        # Confirmar
-        reply = QMessageBox.question(self, "Confirmar borrado",
-                                     f"¿Borrar igualmente '{current.text()}'?",
+        reply = QMessageBox.question(self, "Confirmar borrado", f"¿Borrar '{os.path.basename(path)}'?",
                                      QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
         try:
-            if kind == "dir":
-                shutil.rmtree(full_path)
-            else:  # file
-                os.remove(full_path)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
             self.refresh()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"No se pudo borrar:\n{str(e)}")
 
-    def _on_double_click(self, item):
-        data = item.data(Qt.UserRole)
-        if not data:
-            return
-        # Si es ".." especial
-        if data == ("..", None):
-            self.go_up()
-            return
-        kind, rel_path, full_path = data
-        if kind == "dir":
-            # Entrar en la carpeta
-            self.current_dir = full_path
-            self.refresh()
-        # Los archivos no hacen nada al hacer doble clic (solo arrastrar)
+    def _on_double_click(self, index):
+        src_idx = self.proxy.mapToSource(index)
+        path = self.model.filePath(src_idx)
+        if os.path.isdir(path):
+            self.current_dir = self._normalize(path)
+            self._update_root_index()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton and hasattr(self, '_drag_start_pos'):
+            # Distancia mínima para iniciar el drag (evita falsos positivos)
+            if (event.pos() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+                return
+            # Iniciar el arrastre
+            self.startDrag(Qt.CopyAction)
+            # Limpiar estado
+            del self._drag_start_pos
+        super().mouseMoveEvent(event)
 
     def startDrag(self, supportedActions):
-        item = self.currentItem()
-        if not item:
+        selected = self.selectedIndexes()
+        if not selected:
             return
-        data = item.data(Qt.UserRole)
-        if not data or data[0] != "file":
-            return  # Solo arrastrar archivos
-        _, rel_path, _ = data
+        idx = selected[0]
+        src_idx = self.proxy.mapToSource(idx)
+        if not src_idx.isValid():
+            return
+        path = self.model.filePath(src_idx)
+        if not os.path.isfile(path):
+            return
+        # Obtener ruta relativa desde la raíz de assets
+        rel = os.path.relpath(path, self.base_assets_root).replace('\\', '/')
         mime = QMimeData()
-        mime.setText(rel_path)  # ruta relativa desde assets_root
+        mime.setText(rel)
         drag = QDrag(self)
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction)
+
+
+class AssetFilterProxyModel(QSortFilterProxyModel):
+    """Proxy que muestra solo carpetas y archivos con extensiones soportadas."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Extensiones soportadas (igual que en FolderAssetBrowser)
+        self.supported_extensions = {
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg',
+            '.mp4', '.mkv', '.avi',
+            '.wav', '.ogg', '.mp3',
+            '.ttf', '.TTF', '.otf',
+        }
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        if not isinstance(model, QFileSystemModel):
+            return True
+        index = model.index(source_row, 0, source_parent)
+        if model.isDir(index):
+            return True   # Mostrar siempre las carpetas
+        file_path = model.filePath(index)
+        ext = os.path.splitext(file_path)[1].lower()
+        return ext in self.supported_extensions
 
 
 # ---------------------------------------------------------------------------
@@ -2155,7 +2318,7 @@ class ElementListPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# Diálogo Añadir Elemento  (con soporte customView y vistas)
+# Diálogo Añadir Elemento (con soporte customView y vistas)
 # ---------------------------------------------------------------------------
 class AddElementDialog(QDialog):
     def __init__(self, parent=None, allowed_types=None):
@@ -2168,7 +2331,7 @@ class AddElementDialog(QDialog):
         types = allowed_types if allowed_types else ThemeElement.TYPES
         self.type_cb.addItems(types)
         self.extra_cb = QCheckBox("extra=\"true\"")
-        self.extra_cb.setChecked(True)
+        self.extra_cb.setChecked(False)
         layout.addRow("Nombre:", self.name_edit)
         layout.addRow("Tipo:", self.type_cb)
         layout.addRow("", self.extra_cb)
@@ -2180,8 +2343,12 @@ class AddElementDialog(QDialog):
     def get_element(self) -> ThemeElement:
         etype = self.type_cb.currentText()
         defaults = {
-            "image": {"path": "./", "pos": "0.5 0.5", "size": "0.5 0.5"},
-            "video": {"path": "./", "pos": "0.5 0.5", "size": "0.5 0.5"},
+            "carousel": {"type": "vertical_wheel", "pos": "0 0", "size": "1 1",
+                         "color": "FFFFFF00", "logoScale": "1.7", "logoSize": "0.1 0.05",
+                         "logoRotation": "7", "logoRotationOrigin": "5.5 0.5", "logoAlignment": "center",
+                         "maxLogoCount": "5", "defaultTransition": "instant", "zIndex": "1"},
+            "image": {"path": "./", "pos": "0.5 0.5", "size": "0.5 0.5", "zIndex": "0"},
+            "video": {"path": "./", "pos": "0.5 0.5", "size": "0.5 0.5", "zIndex": "1"},
             "text": {"pos": "0.5 0.5", "size": "0.5 0.1",
                      "color": "FFFFFF", "fontSize": "0.04", "text": ""},
             "rating": {"pos": "0.5 0.9", "size": "0.3 0.06",
@@ -2193,8 +2360,10 @@ class AddElementDialog(QDialog):
             "textlist": {"pos": "0.5 0.5", "size": "0.4 0.8",
                          "primaryColor": "FFFFFF", "secondaryColor": "AAAAAA",
                          "selectedColor": "FFFF00", "selectorColor": "333333"},
-            "gamecarousel": {"pos": "0.5 0.4", "size": "1.0 0.4",
-                             "color": "FFFFFF", "logoSize": "0.25 0.25"},
+            "gamecarousel": {"type": "vertical_wheel", "pos": "0 0", "size": "1 1",
+                             "logoScale": "1.5", "logoSize": "0.14 0.14", "logoRotation": "-6.5",
+                             "logoRotationOrigin": "5.5 0.5", "logoAlingment": "center", "maxLogoCount": "7",
+                             "imageSource": "marquee", "zIndex": "6"},
         }
         props = defaults.get(etype, {"pos": "0.5 0.5", "size": "0.3 0.3"}).copy()
         # Convertir cada valor a ConditionalValue
@@ -2203,7 +2372,7 @@ class AddElementDialog(QDialog):
             converted_props[key] = [ConditionalValue(value, None)]
         return ThemeElement(
             name=self.name_edit.text().strip() or "e_nuevo",
-            element_type=etype,
+            tag=etype,
             extra=self.extra_cb.isChecked(),
             properties=converted_props,
         )
@@ -2245,6 +2414,93 @@ class AddViewDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Pestaña de assets internas de la aplicación
+# ---------------------------------------------------------------------------
+class InternalAssetsTree(QTreeView):
+    """Árbol de assets internos (incluidos con la aplicación). Los botones de navegación están deshabilitados.
+    Al hacer doble clic en un archivo o carpeta, emite la señal copy_requested con la ruta relativa y absoluta."""
+    copy_requested = Signal(str, str)       # para archivos: (rel_path, full_path)
+    copy_folder_requested = Signal(str, str)  # para carpetas: (rel_path, full_path)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setAnimated(True)
+        self.setIndentation(10)
+        self.setDragEnabled(False)
+        self.setAcceptDrops(False)
+        self.setIconSize(QSize(48, 48))  # Tamaño de miniatura
+
+        internal_assets = resource_path("assets")
+        if not os.path.isdir(internal_assets):
+            internal_assets = ""
+
+        self.model = ThumbnailFileSystemModel()
+        self.model.setRootPath(internal_assets)
+        self.model.setFilter(QDir.Dirs | QDir.Files | QDir.NoDotAndDotDot)
+        self.setModel(self.model)
+        if internal_assets:
+            self.setRootIndex(self.model.index(internal_assets))
+
+        # Ocultar columnas extra
+        for col in range(1, self.model.columnCount()):
+            self.setColumnHidden(col, True)
+
+        self.doubleClicked.connect(self._on_double_click)
+
+    def _on_double_click(self, index):
+        file_path = self.model.filePath(index)
+        if os.path.isdir(file_path):
+            # Es una carpeta
+            root_path = self.model.rootPath()
+            if root_path and file_path.startswith(root_path):
+                rel_path = os.path.relpath(file_path, root_path).replace('\\', '/')
+                self.copy_folder_requested.emit(rel_path, file_path)
+        elif os.path.isfile(file_path):
+            root_path = self.model.rootPath()
+            if root_path and file_path.startswith(root_path):
+                rel_path = os.path.relpath(file_path, root_path).replace('\\', '/')
+                self.copy_requested.emit(rel_path, file_path)
+
+
+class ThumbnailFileSystemModel(QFileSystemModel):
+    """Modelo de sistema de archivos que devuelve miniaturas para imágenes y SVGs."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.icon_size = QSize(48, 48)
+        self.thumb_cache = {}
+
+    def data(self, index, role=Qt.DisplayRole):
+        if role == Qt.DecorationRole and index.column() == 0:
+            file_path = self.filePath(index)
+            if os.path.isfile(file_path):
+                if file_path in self.thumb_cache:
+                    return self.thumb_cache[file_path]
+                icon = self._generate_thumbnail(file_path)
+                if icon:
+                    self.thumb_cache[file_path] = icon
+                    return icon
+        return super().data(index, role)
+
+    def _generate_thumbnail(self, file_path):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in ('.png', '.jpg', '.jpeg', '.gif', '.webp'):
+            pix = QPixmap(file_path)
+            if not pix.isNull():
+                return QIcon(pix.scaled(self.icon_size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        elif ext == '.svg':
+            renderer = QSvgRenderer(file_path)
+            if renderer.isValid():
+                pix = QPixmap(self.icon_size)
+                pix.fill(Qt.transparent)
+                painter = QPainter(pix)
+                renderer.render(painter)
+                painter.end()
+                return QIcon(pix)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Visual Builder Tab
 # ---------------------------------------------------------------------------
 class VisualBuilderTab(QWidget):
@@ -2255,9 +2511,12 @@ class VisualBuilderTab(QWidget):
         super().__init__()
         self.theme_model = theme_model
         self.assets_root = assets_root
+        self.theme_assets_browser = None
+        self.internal_assets_tree = None
         self._current_view: ThemeView | None = None
         self._undo_stack = QUndoStack(self)
         self._setup_ui()
+        self._is_theme_loaded = False
 
     def set_rulers_visible(self, visible):
         if hasattr(self._canvas, 'set_rulers_visible'):
@@ -2267,33 +2526,41 @@ class VisualBuilderTab(QWidget):
         main_layout = QVBoxLayout(self)
 
         # Cargar iconos desde la carpeta 'iconos'
-        icon_up = QIcon(resource_path("iconos/subir.ico"))
-        icon_home = QIcon(resource_path("iconos/home.ico"))
         icon_agregar = QIcon(resource_path("iconos/agregar.ico"))
-        icon_delete = QIcon(resource_path("iconos/borrar.ico"))
+        icon_menos = QIcon(resource_path("iconos/menos.ico"))
 
         # Toolbar vistas + undo
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("Vista:"))
-        self._view_cb = QComboBox()
-        self._view_cb.setMinimumWidth(150)
-        self._view_cb.currentIndexChanged.connect(self._on_view_changed)
+        self._view_cb = QLabel()
+        self._view_cb.setFixedWidth(270)
+        self._view_cb.setMaximumHeight(30)
+        self._view_cb.setWordWrap(True)
+        self._view_cb.setStyleSheet("background: #1e1e1e; color: #d4d4d4; padding: 4px;")
         toolbar.addWidget(self._view_cb)
 
-        btn_add_view = QPushButton(icon_agregar, " Vista")
-        btn_del_view = QPushButton(icon_delete, " Vista")
-        btn_add_elem = QPushButton(icon_agregar, " Elemento")
-        btn_add_view.clicked.connect(self._add_view)
-        btn_del_view.clicked.connect(self._delete_view)
-        btn_add_elem.clicked.connect(self._add_element)
-        for b in (btn_add_view, btn_del_view, btn_add_elem):
+        self._btn_add_view = QPushButton(icon_agregar, " Vista")
+        self._btn_add_view.setEnabled(False)
+        self._btn_del_view = QPushButton(icon_menos, " Vista")
+        self._btn_del_view.setEnabled(False)
+        self._btn_add_elem = QPushButton(icon_agregar, " Elemento")
+        self._btn_add_elem.setEnabled(False) # Deshabilitado por defecto
+        btn_del_elem = QPushButton(icon_menos, " Elemento")
+        btn_del_elem.setToolTip("Eliminar el elemento seleccionado")
+        self._btn_add_view.clicked.connect(self._add_view)
+        self._btn_del_view.clicked.connect(self._delete_view)
+        self._btn_add_elem.clicked.connect(self._add_element)
+        btn_del_elem.clicked.connect(self._delete_selected_element)
+        for b in (self._btn_add_view, self._btn_del_view, self._btn_add_elem, btn_del_elem):
             toolbar.addWidget(b)
+
+        self._btn_del_elem = btn_del_elem
+        self._btn_del_elem.setEnabled(False) # inicialmente deshabilitado
 
         # Selector de sistema para resolver ${system.theme}
         toolbar.addWidget(QLabel("  Sistema de ejemplo:"))
         self._system_cb = QComboBox()
-        self._system_cb.setEditable(True)  # permite escribir cualquier nombre
-        self._system_cb.addItems(["arcade", "gba", "nes", "megadrive", "psx", "retrobat","snes"])
+        self._system_cb.addItems(["arcade", "gba", "megadrive", "neogeo", "nes", "psx", "retrobat","snes"])
         self._system_cb.setCurrentText("snes")
         self._system_cb.currentTextChanged.connect(self._on_system_changed)
         toolbar.addWidget(self._system_cb)
@@ -2323,40 +2590,37 @@ class VisualBuilderTab(QWidget):
         self._assets_path_lbl.setWordWrap(True)
         lv.addWidget(self._assets_path_lbl)
 
-        # Navegador de directorios
-        self._asset_browser = FolderAssetBrowser(self.assets_root)
+        # Crear pestañas de assets
+        self.assets_tabs = QTabWidget()
 
-        # Barra de navegación (subir/raíz) justo debajo de la ruta
-        nav_layout = QGridLayout()
-        nav_layout.setHorizontalSpacing(10)
-        nav_layout.setVerticalSpacing(5)
+        # Pestaña 1: Theme Assets (con barra de navegación)
+        self.theme_assets_browser = FolderAssetBrowser(self.assets_root)
+        theme_panel = self._create_asset_panel(self.theme_assets_browser, show_nav=True)
+        self.assets_tabs.addTab(theme_panel, "Theme Assets")
 
-        # Crear los botones
-        btn_up = QPushButton(icon_up, " Subir")
-        btn_root = QPushButton(icon_home, " Raíz")
-        btn_agregar = QPushButton(icon_agregar, " Añadir")
-        btn_delete = QPushButton(icon_delete, " Borrar")
+        # Pestaña 2: Internal Assets (sin barra de navegación, con miniaturas y mensaje)
+        self.internal_assets_tree = InternalAssetsTree()
+        self.internal_assets_tree.copy_requested.connect(self._copy_internal_asset)
+        self.internal_assets_tree.copy_folder_requested.connect(self._copy_internal_folder)
 
-        # Conectar señales
-        btn_up.clicked.connect(self._asset_browser.go_up)
-        btn_root.clicked.connect(self._asset_browser.go_root)
-        btn_agregar.clicked.connect(lambda: self._asset_browser.add_item(btn_agregar))  # ← pasamos el botón
-        btn_delete.clicked.connect(self._asset_browser.delete_item)
+        internal_panel = QWidget()
+        internal_layout = QVBoxLayout(internal_panel)
+        internal_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Colocar en el grid: primera fila (fila 0) con Subir y Raíz
-        nav_layout.addWidget(btn_up, 0, 0)
-        nav_layout.addWidget(btn_root, 0, 1)
-        # Segunda fila (fila 1) con Añadir y Borrar
-        nav_layout.addWidget(btn_agregar, 1, 0)
-        nav_layout.addWidget(btn_delete, 1, 1)
+        info_label = QLabel(
+            "📁 Haz doble clic en un elemento (archivo o carpeta) para copiarlo al directorio de assets del theme actual.\n\n"
+            "• Archivos: se copian individualmente.\n"
+            "• Carpetas: se copia todo su contenido (subcarpetas y archivos).")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet(
+            "background: #2d2d2d; color: #ffaa00; padding: 4px; border-radius: 4px; margin: 0 0 5px 0;")
+        internal_layout.addWidget(info_label)
 
-        # Añadir el stretch al final (ocupa espacio extra, opcional)
-        nav_layout.setColumnStretch(0, 1)
-        nav_layout.setColumnStretch(1, 1)
+        internal_layout.addWidget(self.internal_assets_tree)
+        self.assets_tabs.addTab(internal_panel, "Internal Assets")
 
-        lv.addLayout(nav_layout)
+        lv.addWidget(self.assets_tabs, 2)
 
-        lv.addWidget(self._asset_browser, 2)
         self._elem_list = ElementListPanel()
         self._elem_list.element_selected.connect(self._on_elem_from_list)
         self._elem_list.element_deleted.connect(self._on_elem_deleted)
@@ -2372,6 +2636,7 @@ class VisualBuilderTab(QWidget):
 
         # Derecha: Propiedades del elemento
         self._inspector = PropertiesPanel(self._undo_stack)
+        self._inspector.set_refresh_callback(self._refresh_elem_list)
         self._inspector.properties_changed.connect(self._on_props_changed)
         splitter.addWidget(self._inspector)
 
@@ -2384,30 +2649,222 @@ class VisualBuilderTab(QWidget):
         splitter.widget(2).setMinimumWidth(300)  # propiedades del elemento
         main_layout.addWidget(splitter)
 
+    # Creación de pestañas para los assets del theme e internos
+    def _create_asset_panel(self, browser: FolderAssetBrowser, show_nav: bool = True) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        if show_nav:
+            icon_up = QIcon(resource_path("iconos/subir.ico"))
+            icon_home = QIcon(resource_path("iconos/home.ico"))
+            icon_agregar = QIcon(resource_path("iconos/agregar.ico"))
+            icon_delete = QIcon(resource_path("iconos/borrar.ico"))
+
+            nav_layout = QGridLayout()
+            nav_layout.setHorizontalSpacing(10)
+            nav_layout.setVerticalSpacing(5)
+            btn_up = QPushButton(icon_up, " Subir")
+            btn_root = QPushButton(icon_home, " Raíz")
+            btn_agregar = QPushButton(icon_agregar, " Añadir")
+            btn_delete = QPushButton(icon_delete, " Borrar")
+            btn_up.clicked.connect(browser.go_up)
+            btn_root.clicked.connect(browser.go_root)
+            btn_agregar.clicked.connect(lambda: browser.add_item(btn_agregar))
+            btn_delete.clicked.connect(browser.delete_item)
+            nav_layout.addWidget(btn_up, 0, 0)
+            nav_layout.addWidget(btn_root, 0, 1)
+            nav_layout.addWidget(btn_agregar, 1, 0)
+            nav_layout.addWidget(btn_delete, 1, 1)
+            nav_layout.setColumnStretch(0, 1)
+            nav_layout.setColumnStretch(1, 1)
+            layout.addLayout(nav_layout)
+        layout.addWidget(browser)
+        return panel
+
+    # Copiar asset o carpeta interno al del theme cargado
+    def _copy_internal_asset(self, rel_path: str, full_path: str):
+        """Copia un asset interno al directorio de assets del theme actual."""
+        if not self.assets_root or not os.path.isdir(self.assets_root):
+            QMessageBox.warning(self, "Sin carpeta de assets", "Primero debes tener un theme con carpeta de assets.")
+            return
+        # Pedir carpeta de destino dentro de assets_root
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, "Seleccionar carpeta de destino en el theme",
+            self.assets_root,
+            options=QFileDialog.ShowDirsOnly
+        )
+        if not dest_dir:
+            return
+        dest_path = os.path.join(dest_dir, os.path.basename(full_path))
+        if os.path.exists(dest_path):
+            reply = QMessageBox.question(
+                self, "Sobrescribir",
+                f"El archivo '{os.path.basename(full_path)}' ya existe en el destino.\n¿Sobrescribir?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        try:
+            shutil.copy2(full_path, dest_path)
+            QMessageBox.information(self, "Copiado", f"Asset copiado a:\n{dest_path}")
+            # Refrescar el navegador de assets del tema
+            self.theme_assets_browser.refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo copiar:\n{str(e)}")
+
+    def _copy_internal_folder(self, rel_path: str, full_path: str):
+        """Copia una carpeta entera (con todo su contenido) al directorio de assets del theme actual, mostrando progreso."""
+        if not self.assets_root or not os.path.isdir(self.assets_root):
+            QMessageBox.warning(self, "Sin carpeta de assets", "Primero debes tener un theme con carpeta de assets.")
+            return
+
+        # Pedir carpeta de destino dentro de assets_root
+        dest_dir = QFileDialog.getExistingDirectory(
+            self, "Seleccionar carpeta de destino en el theme",
+            self.assets_root,
+            options=QFileDialog.ShowDirsOnly
+        )
+        if not dest_dir:
+            return
+
+        folder_name = os.path.basename(full_path)
+        dest_path = os.path.join(dest_dir, folder_name)
+
+        # Verificar si ya existe
+        if os.path.exists(dest_path):
+            reply = QMessageBox.question(
+                self, "Sobrescribir",
+                f"La carpeta '{folder_name}' ya existe en el destino.\n¿Sobrescribir su contenido?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            # Eliminar la carpeta destino existente para sobrescribir limpio
+            shutil.rmtree(dest_path)
+
+        # ---- Contar archivos totales a copiar ----
+        total_files = 0
+        for root, dirs, files in os.walk(full_path):
+            total_files += len(files)
+
+        if total_files == 0:
+            QMessageBox.information(self, "Carpeta vacía", "La carpeta seleccionada no contiene archivos para copiar.")
+            return
+
+        # ---- Crear diálogo de progreso ----
+        progress = QProgressDialog(f"Copiando carpeta '{folder_name}'...", "Cancelar", 0, total_files, self)
+        progress.setWindowTitle("Copiando...")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)  # Muestra el diálogo inmediatamente
+        progress.setMinimumSize(500, 100)
+        progress.setValue(0)
+
+        # Personalizar la barra de progreso
+        bar = progress.findChild(QProgressBar)
+        if bar:
+            bar.setStyleSheet("""
+                QProgressBar {
+                    border: 2px solid #1565C0;
+                    border-radius: 6px;
+                    height: 20px;          /* Altura de la barra */
+                    text-align: center;
+                    font-weight: bold;
+                    background-color: #1e1e1e;
+                }
+                QProgressBar::chunk {
+                    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2E7D32, stop:1 #2EA332);
+                    border-radius: 5px;
+                }
+            """)
+
+        copied_count = 0
+        cancelado = False
+
+        try:
+            # Aseguramos que la carpeta destino existe
+            os.makedirs(dest_path, exist_ok=True)
+            for root, dirs, files in os.walk(full_path):
+                # Crear subcarpetas en destino
+                rel_root = os.path.relpath(root, full_path)
+                dest_sub = os.path.join(dest_path, rel_root) if rel_root != '.' else dest_path
+                os.makedirs(dest_sub, exist_ok=True)
+
+                for file in files:
+                    src_file = os.path.join(root, file)
+                    dst_file = os.path.join(dest_sub, file)
+                    if progress.wasCanceled():
+                        cancelado = True
+                        raise InterruptedError("Cancelado por el usuario")
+                    shutil.copy2(src_file, dst_file)
+                    copied_count += 1
+                    progress.setValue(copied_count)
+                    progress.setLabelText(f"Copiando {copied_count} de {total_files}\n{os.path.basename(src_file)}")
+                    QApplication.processEvents()
+
+            if not cancelado:
+                progress.setValue(total_files)
+                normalized_path = os.path.normpath(dest_path)
+                QMessageBox.information(self, "Copia completada",
+                                        f"Se copiaron {copied_count} archivos en:\n{normalized_path}")
+                # Refrescar navegador de assets
+                self.theme_assets_browser.refresh()
+
+        except InterruptedError:
+            # Si se canceló, eliminar la carpeta destino parcial
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path, ignore_errors=True)
+            QMessageBox.warning(self, "Cancelado", "La copia fue cancelada. No se copió ningún archivo.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo copiar la carpeta:\n{str(e)}")
+            # Limpiar archivos parciales
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path, ignore_errors=True)
+
+    # Habilitar botón Añadir vista y Eliminar vista (si exite)
+    def _update_buttons_state(self):
+        has_views = self._is_theme_loaded and len(self.theme_model.views) > 0
+        self._btn_add_view.setEnabled(self._is_theme_loaded)
+        self._btn_del_view.setEnabled(has_views)
+
     def refresh_views(self):
-        self._view_cb.blockSignals(True)
-        self._view_cb.clear()
-        for v in self.theme_model.views:
-            label = f"[customView] {v.name}" if v.is_custom else v.name
-            self._view_cb.addItem(label)
-        self._view_cb.blockSignals(False)
-        if self.theme_model.views:
-            self._view_cb.setCurrentIndex(0)
-            self._set_view(self.theme_model.views[0])
+        if self.theme_model is None:
+            self._canvas.set_view(None)
+            self._view_cb.setText("")
+            return
+        # Tomamos la primera vista por defecto, o la que esté activa
+        elif self.theme_model.views:
+            # Si ya hay una vista actual, la respetamos; si no, tomamos la primera
+            if self._current_view is None or self._current_view not in self.theme_model.views:
+                self._set_view(self.theme_model.views[0])
+            else:
+                self._set_view(self._current_view)
+            # Actualizar el texto del QTextEdit
+            view = self._current_view
+            label = f"[customView] {view.name}" if view.is_custom else view.name
+            self._view_cb.setText(label)
         else:
             self._set_view(None)
+            self._view_cb.setText("")
+        self._update_buttons_state()  # Habilitar botónes añadir vista y eliminar vista
 
     def load_model(self, model: ThemeModel):
         """Carga un modelo distinto en el builder (usado por ThemeSet)."""
         self.theme_model = model
         self._undo_stack.clear()
         self.refresh_views()
+        # Habilitar botónes añadir vista y eliminar vista dependiendo de si el modelo tiene vistas
+        self._is_theme_loaded = True
+        self._update_buttons_state()
 
     def _set_view(self, view: ThemeView | None):
         self._current_view = view
         self._canvas.set_view(view)
         self._elem_list.refresh(view)
         self._inspector.set_element(None)
+
+        # Habilitar o deshabilitar el botón "Añadir Elemento"
+        self._btn_add_elem.setEnabled(view is not None)
+
         # Forzar la resolución del sistema actual (para media con ${system.theme]
         if view is not None:
             current_system = self._system_cb.currentText().strip()
@@ -2415,12 +2872,6 @@ class VisualBuilderTab(QWidget):
                 self._canvas.set_context(current_system, getattr(self.theme_model, 'variables', {}))
             else:
                 self._canvas.set_context("", {})
-
-    def _on_view_changed(self, idx: int):
-        if 0 <= idx < len(self.theme_model.views):
-            self._set_view(self.theme_model.views[idx])
-        else:
-            self._set_view(None)
 
     def _add_view(self):
         existing = [v.name for v in self.theme_model.views]
@@ -2432,8 +2883,7 @@ class VisualBuilderTab(QWidget):
                 return
             self.theme_model.views.append(view)
             self.refresh_views()
-            idx = len(self.theme_model.views) - 1
-            self._view_cb.setCurrentIndex(idx)
+            self._update_buttons_state()  # Habilitar botónes añadir vista y eliminar vista
 
         self.model_changed.emit()
 
@@ -2442,6 +2892,7 @@ class VisualBuilderTab(QWidget):
             return
         self.theme_model.remove_view(self._current_view.name)
         self.refresh_views()
+        self._update_buttons_state()  # Habilitar botónes añadir vista y eliminar vista
 
         self.model_changed.emit()
 
@@ -2464,6 +2915,21 @@ class VisualBuilderTab(QWidget):
 
         self.model_changed.emit()
 
+    def _delete_selected_element(self):
+        """Elimina el elemento actualmente seleccionado con confirmación."""
+        elem = self._inspector._elem
+        if not elem:
+            QMessageBox.warning(self, "Sin selección", "No hay ningún elemento seleccionado.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirmar borrado",
+            f"¿Eliminar el elemento '{elem.name}' (tipo: {elem.element_type})?\nEsta acción se puede deshacer.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self._on_elem_deleted(elem)
+
     def _get_allowed_types_for_view(self, view: ThemeView) -> List[str]:
         """Devuelve los tipos de elemento que se pueden añadir en la vista dada."""
         # Si es una customView y tiene herencia, usamos los tipos de la vista base
@@ -2484,6 +2950,7 @@ class VisualBuilderTab(QWidget):
     def _on_elem_from_list(self, elem: ThemeElement):
         self._inspector.set_element(elem, self._canvas)
         self._canvas.select_element(elem)
+        self._btn_del_elem.setEnabled(True)
 
         self.model_changed.emit()
 
@@ -2491,6 +2958,7 @@ class VisualBuilderTab(QWidget):
         self._inspector.set_element(elem, self._canvas)
         if elem:
             self._elem_list.select_elem(elem)
+        self._btn_del_elem.setEnabled(elem is not None)
 
     def _on_elem_deleted(self, elem: ThemeElement):
         if self._current_view:
@@ -2498,6 +2966,7 @@ class VisualBuilderTab(QWidget):
                              refresh_fn=self._refresh_elem_list)
             self._undo_stack.push(cmd)
             self._inspector.set_element(None)
+            self._btn_del_elem.setEnabled(False)
 
     def _refresh_elem_list(self):
         self._elem_list.refresh(self._current_view)
@@ -2518,7 +2987,7 @@ class VisualBuilderTab(QWidget):
         if new_root and new_root != self.assets_root:
             self.assets_root = new_root
             self._canvas.assets_root = new_root
-            self._asset_browser.set_root(new_root)
+            self.theme_assets_browser.set_root(new_root)
             self._assets_path_lbl.setText(new_root)
             self.assets_root_changed.emit(new_root)
 
@@ -2546,19 +3015,18 @@ class PreviewTab(QWidget):
         self.current_system = ""
         layout = QVBoxLayout(self)
         bar = QHBoxLayout()
-        self._view_cb = QComboBox()
-        self._view_cb.currentIndexChanged.connect(self._on_view_changed)
-        btn_refresh = QPushButton("Actualizar")
-        btn_refresh.clicked.connect(self.refresh)
+        self._view_cb = QLabel()
+        self._view_cb.setFixedWidth(270)
+        self._view_cb.setMaximumHeight(30)
+        self._view_cb.setWordWrap(True)
+        self._view_cb.setStyleSheet("background: #1e1e1e; color: #d4d4d4; padding: 4px;")
         bar.addWidget(QLabel("Vista:"))
         bar.addWidget(self._view_cb)
-        bar.addWidget(btn_refresh)
 
         # Selector de sistema
         bar.addWidget(QLabel("Sistema de ejemplo:"))
         self._system_cb = QComboBox()
-        self._system_cb.setEditable(True)
-        self._system_cb.addItems(["arcade", "gba", "nes", "megadrive", "psx", "retrobat", "snes"])
+        self._system_cb.addItems(["arcade", "gba", "megadrive", "neogeo", "nes", "psx", "retrobat","snes"])
         self._system_cb.setCurrentText("snes")
         self._system_cb.currentTextChanged.connect(self._on_system_changed)
         bar.addWidget(self._system_cb)
@@ -2591,21 +3059,25 @@ class PreviewTab(QWidget):
         self._canvas.assets_root = root
 
     def refresh(self):
-        cur = self._view_cb.currentText()
-        self._view_cb.blockSignals(True)
-        self._view_cb.clear()
-        for v in self.theme_model.views:
-            self._view_cb.addItem(v.name)
-        idx = next((i for i, v in enumerate(self.theme_model.views)
-                    if v.name == cur), 0)
-        self._view_cb.setCurrentIndex(idx)
-        self._view_cb.blockSignals(False)
-        self._load_view(idx)
+        if self.theme_model.views:
+            # Obtener la vista actual desde el canvas (si existe y es válida)
+            current = self._canvas._current_view
+            if current is None or current not in self.theme_model.views:
+                view = self.theme_model.views[0]
+            else:
+                view = current
+            self._load_view(view)
+            # Mostrar el nombre igual que en el editor visual
+            label = f"[customView] {view.name}" if view.is_custom else view.name
+            self._view_cb.setText(label)
+        else:
+            self._canvas.set_view(None)
+            self._view_cb.setText("")
 
-    def _load_view(self, idx: int):
-        if 0 <= idx < len(self.theme_model.views):
-            self._canvas.set_view(self.theme_model.views[idx])
-            # Forzar sistema actual
+    def _load_view(self, view: ThemeView):
+        if view:
+            self._canvas.set_view(view)
+            # actualizar contexto etc.
             current_system = self._system_cb.currentText().strip()
             if current_system:
                 self._canvas.set_context(current_system, getattr(self.theme_model, 'variables', {}))
@@ -2613,9 +3085,6 @@ class PreviewTab(QWidget):
                 self._canvas.set_context("", {})
         else:
             self._canvas.set_view(None)
-
-    def _on_view_changed(self, idx: int):
-        self._load_view(idx)
 
 
 # ---------------------------------------------------------------------------
@@ -2690,7 +3159,7 @@ class ThemeSetTab(QWidget):
         rv.addWidget(QLabel("Vista previa theme.xml del sistema:"))
         self._xml_preview = QPlainTextEdit()
         self._xml_preview.setReadOnly(True)
-        self._xml_preview.setFont(QFont("Monospace", 9))
+        self._xml_preview.setFont(QFont("Monospace", 10))
         self._xml_preview.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
         XMLHighlighter(self._xml_preview.document())
         rv.addWidget(self._xml_preview)
@@ -2805,8 +3274,9 @@ class MainWindow(QMainWindow):
         self._assets_root = resource_path("assets")
 
         # Modelo activo (puede ser reemplazado por ThemeSet)
-        self.theme_model = ThemeModel(name="mi_tema")
-        self._active_system: str | None = None  # para indicar qué sistema se edita
+        self.theme_model = None
+        self._active_system = None  # para indicar qué sistema se edita
+        self._saved_model_xml = ""  # XML del último guardado
 
         # Theme Set
         self._theme_set = ThemeSet("mi_theme_set")
@@ -2819,17 +3289,35 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
 
+        # Opción de guardado si hay cambios
+        self._changes_unsaved = False
+
         # Tab 1: Editor XML
         self._xml_tab = XMLEditorTab(self.theme_model)
         self._xml_tab.model_changed.connect(self._on_model_from_xml)
         self._xml_tab.model_changed.connect(self._on_current_model_changed)
         self._tabs.addTab(self._xml_tab, "Editor XML")
 
+        # Detección de "Deshacer", "Rehacer" en el XML y archivo XML cargado
+        self._xml_tab.editor.undoAvailable.connect(self._on_xml_undo_available)
+        self._xml_tab.editor.redoAvailable.connect(self._on_xml_redo_available)
+        self._xml_tab.file_loaded.connect(self._on_xml_file_loaded)
+
+        # Detección de cambios sin guardar en el XML
+        self._xml_tab.editor.document().modificationChanged.connect(self._update_unsaved_flag)
+
         # Tab 2: Editor Visual
         self._builder_tab = VisualBuilderTab(self.theme_model, self._assets_root)
         self._builder_tab.assets_root_changed.connect(self._on_assets_root_changed)
         self._builder_tab.model_changed.connect(self._on_current_model_changed)
         self._tabs.addTab(self._builder_tab, "Editor Visual")
+
+        # Detección de "Deshacer" y "Rehacer"
+        self._builder_tab._undo_stack.canUndoChanged.connect(self._on_builder_undo_available)
+        self._builder_tab._undo_stack.canRedoChanged.connect(self._on_builder_redo_available)
+
+        # Detección de cambios sin guardar en el "Editor visual"
+        self._builder_tab._undo_stack.cleanChanged.connect(self._on_builder_clean_changed)
 
         # Tab 3: Vista Previa
         self._preview_tab = PreviewTab(self.theme_model, self._assets_root)
@@ -2854,8 +3342,67 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-        # Aplicar tema inicial
+        # Aplicar tema inicial (modo oscuro o modo claro)
         self.apply_system_theme()
+
+    # Función para detectar archivo XML cargado
+    def _on_xml_file_loaded(self):
+        """Se llama cuando se carga un archivo XML desde disco (nuevo o importado)."""
+        if self.theme_model:
+            self._saved_model_xml = self.theme_model.to_xml()
+            self._changes_unsaved = False
+            self._update_save_action_state()
+            # También limpiamos la pila del editor visual para evitar comandos obsoletos
+            self._builder_tab._undo_stack.clear()
+            self._builder_tab._undo_stack.setClean()
+            self._builder_tab._canvas._pixmap_cache.clear()
+
+    # Funciones para activar "deshacer y rehacer"
+    def _update_undo_redo_state(self):
+        """Actualiza el estado de los botones Deshacer/Rehacer según la pestaña activa."""
+        current = self._tabs.currentWidget()
+        if current == self._xml_tab:
+            self.undo_action.setEnabled(self._xml_tab.editor.document().isUndoAvailable())
+            self.redo_action.setEnabled(self._xml_tab.editor.document().isRedoAvailable())
+        elif current == self._builder_tab:
+            self.undo_action.setEnabled(self._builder_tab._undo_stack.canUndo())
+            self.redo_action.setEnabled(self._builder_tab._undo_stack.canRedo())
+        else:
+            self.undo_action.setEnabled(False)
+            self.redo_action.setEnabled(False)
+
+    def _on_xml_undo_available(self, available: bool):
+        if self._tabs.currentWidget() == self._xml_tab:
+            self.undo_action.setEnabled(available)
+
+    def _on_xml_redo_available(self, available: bool):
+        if self._tabs.currentWidget() == self._xml_tab:
+            self.redo_action.setEnabled(available)
+
+    def _on_builder_undo_available(self, available: bool):
+        # Solo actualiza si la pestaña activa es la del builder
+        if self._tabs.currentWidget() == self._builder_tab:
+            self.undo_action.setEnabled(available)
+
+    def _on_builder_redo_available(self, available: bool):
+        if self._tabs.currentWidget() == self._builder_tab:
+            self.redo_action.setEnabled(available)
+
+    # Habilitar botón de guardado
+    def _on_xml_modification_changed(self, changed: bool):
+        self._update_unsaved_flag()
+
+    def _on_builder_clean_changed(self):
+        self._update_unsaved_flag()
+
+    def _update_save_action_state(self):
+        """Habilita Guardar si el modelo tiene cambios sin guardar."""
+        self.save_action.setEnabled(self.theme_model is not None and self._changes_unsaved)
+
+    # Habilitar botón "Nuevo XML"
+    def _update_actions_state(self):
+        has_model = self.theme_model is not None
+        self.new_action.setEnabled(has_model)
 
     # ------------------------------------------------------------------
     # Centrar la ventana de la aplicación al ejecutarse en el monitor
@@ -2885,7 +3432,7 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------
-    # Aplicar tema del sistema
+    # Aplicar theme del sistema
     # ------------------------------------------------------------------
     def apply_system_theme(self):
         """Aplica el tema de la aplicación según el tema del sistema."""
@@ -2914,26 +3461,25 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def create_action(self):
         self.new_action = QAction(QIcon(resource_path("iconos/new.ico")), "Nuevo XML")
+        self.new_action.setEnabled(False) # Deshabilitado al arrancar la aplicación
         self.new_action.setShortcut("Ctrl+N")
         self.new_action.setStatusTip("Nuevo XML")
         self.new_action.triggered.connect(self.new)
 
-        self.open_action = QAction(QIcon(resource_path("iconos/open.ico")), "Abrir XML")
-        self.open_action.setShortcut(QKeySequence("Ctrl+O"))
-        self.open_action.setStatusTip("Abrir archivo")
-        self.open_action.triggered.connect(self.open)
-
         self.save_action = QAction(QIcon(resource_path("iconos/save.ico")), "Guardar XML")
+        self.save_action.setEnabled(False) # Deshabilitado al arrancar la aplicación
         self.save_action.setShortcut(QKeySequence("Ctrl+S"))
         self.save_action.setStatusTip("Guardar archivo")
         self.save_action.triggered.connect(self.save)
 
         self.undo_action = QAction(QIcon(resource_path("iconos/deshacer.ico")), "Deshacer")
+        self.undo_action.setEnabled(False) # Deshabilitado al arrancar la aplicación
         self.undo_action.setShortcut(QKeySequence("Ctrl+Z"))
         self.undo_action.setStatusTip("Deshacer cambio")
         self.undo_action.triggered.connect(self.global_undo)
 
         self.redo_action = QAction(QIcon(resource_path("iconos/rehacer.ico")), "Rehacer")
+        self.redo_action.setEnabled(False) # Deshabilitado al arrancar la aplicación
         self.redo_action.setShortcut(QKeySequence("Ctrl+Shift+Z"))
         self.redo_action.setStatusTip("Rehacer cambio")
         self.redo_action.triggered.connect(self.global_redo)
@@ -2947,7 +3493,7 @@ class MainWindow(QMainWindow):
         self.new_theme_action.setStatusTip("Crear un theme nuevo")
         self.new_theme_action.triggered.connect(self.new_theme_set)
 
-        self.view_changelog = QAction("Ver novedades...")
+        self.view_changelog = QAction("Ver Changelog...")
         self.view_changelog.triggered.connect(self.show_changelog_dialog)
         self.update_program = QAction("Buscar actualizaciones...")
         self.update_program.triggered.connect(self.check_for_updates_manual)
@@ -2958,7 +3504,6 @@ class MainWindow(QMainWindow):
         menu_archivo = self.menuBar().addMenu("Archivo")
         menu_archivo.addAction(self.new_action)
         menu_archivo.addAction(self.new_theme_action)
-        menu_archivo.addAction(self.open_action)
         menu_archivo.addAction(self.save_action)
         menu_archivo.addSeparator()
         menu_archivo.addAction(self.import_theme_action)
@@ -2981,9 +3526,6 @@ class MainWindow(QMainWindow):
 
     def new(self):
         self._xml_tab._new_xml()
-
-    def open(self):
-        self._xml_tab._load_file()
 
     def show_changelog_dialog(self):
         """Muestra el changelog completo (sin filtrar por versión)."""
@@ -3019,7 +3561,7 @@ class MainWindow(QMainWindow):
         text_edit = QTextEdit()
         text_edit.setReadOnly(True)
         text_edit.setPlainText(clean_text)
-        text_edit.setStyleSheet("background: #2d2d2d; color: #f0f0f0; font-family: monospace;")
+        text_edit.setStyleSheet("background: #2d2d2d; color: #f0f0f0; font-family: Arial;font-size: 14px;")
         layout.addWidget(text_edit)
 
         btn_close = QPushButton("Cerrar")
@@ -3121,10 +3663,20 @@ class MainWindow(QMainWindow):
             with open(theme_xml_path, "w", encoding="utf-8") as f:
                 f.write(xml_content)
             self.statusBar().showMessage(f"Archivo guardado en: {theme_xml_path}", 5000)
+
             # Sincronizar el editor XML inmediatamente después de guardar
             self._xml_tab.editor.blockSignals(True)
             self._xml_tab.editor.setPlainText(xml_content)
             self._xml_tab.editor.blockSignals(False)
+
+            # Después de guardar correctamente:
+            self._saved_model_xml = self.theme_model.to_xml()
+            self._changes_unsaved = False
+            self._update_save_action_state()
+            # Marcar el documento XML como limpio
+            self._xml_tab.editor.document().setModified(False)
+            # Marcar la pila del builder como limpia
+            self._builder_tab._undo_stack.setClean()
         except Exception as e:
             QMessageBox.critical(self, "Error al guardar", str(e))
 
@@ -3211,11 +3763,22 @@ class MainWindow(QMainWindow):
             self._assets_root = theme_folder
             self._builder_tab.assets_root = theme_folder
             self._builder_tab._canvas.assets_root = theme_folder
-            self._builder_tab._asset_browser.set_root(theme_folder)
+            self._builder_tab.theme_assets_browser.set_root(theme_folder)
             self._builder_tab._assets_path_lbl.setText(theme_folder)
             self._builder_tab.assets_root_changed.emit(theme_folder)
             self._preview_tab.set_assets_root(theme_folder)
             self._xml_tab._update_create_folder_button_state()  # Habilitar botón de crear carpeta
+            self._update_actions_state() # Habilitar guardado
+            self._update_undo_redo_state() # Conectar detección de habilitar "Deshacer" y "Rehacer"
+
+            # Resetear bandera opción "Guardar" y resetear pila de cambios
+            self._saved_model_xml = self.theme_model.to_xml()
+            self._changes_unsaved = False
+            self._update_save_action_state()
+            self._builder_tab._undo_stack.clear()
+            self._builder_tab._undo_stack.setClean()
+            self._editing_system_from_set = None
+            self._theme_set_modified = False
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"No se pudo crear el theme:\n{str(e)}")
@@ -3286,7 +3849,6 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._colored_separator("#f3f4f7", width=1, height=25))
         tb.addAction(self.new_action)
         tb.addAction(self.new_theme_action)
-        tb.addAction(self.open_action)
         tb.addAction(self.save_action)
         tb.addWidget(self._colored_separator("#f3f4f7", width=1, height=25))
         tb.addAction(self.import_theme_action)
@@ -3314,33 +3876,82 @@ class MainWindow(QMainWindow):
         self._assets_root = new_root
         self._preview_tab.set_assets_root(new_root)
         self._set_tab.assets_root = new_root
+        self._builder_tab.theme_assets_browser.set_root(new_root)
         self.statusBar().showMessage(f"Carpeta de assets: {new_root}", 6000)
 
     # ------------------------------------------------------------------
     def _on_tab_changed(self, idx: int):
         tab = self._tabs.widget(idx)
+
+        # Manejar el caso sin theme cargado
+        if self.theme_model is None:
+            if tab is self._builder_tab:
+                # Limpiar el builder
+                self._builder_tab.theme_model = None
+                self._builder_tab._canvas.set_view(None)
+                self._builder_tab._elem_list.refresh(None)
+                self._builder_tab._inspector.set_element(None)
+                self._builder_tab._view_cb.setText("")
+            elif tab is self._preview_tab:
+                self._preview_tab.theme_model = None
+                self._preview_tab._canvas.set_view(None)
+                self._preview_tab._view_cb.setText("")
+            elif tab is self._xml_tab:
+                self._xml_tab.theme_model = None
+                self._xml_tab.refresh_from_model()
+            elif tab is self._set_tab:
+                # ThemeSet no depende del modelo principal, no hacer nada especial
+                pass
+            # Actualizar estado de botones
+            self._update_undo_redo_state()
+            self._update_save_action_state()
+            return
+
+        # Hay theme cargado
         if tab is self._builder_tab:
-            self._builder_tab.refresh_views()
+            # No refrescar si ya tiene la vista correcta
+            if self._builder_tab._current_view not in self.theme_model.views:
+                self._builder_tab.refresh_views()
         elif tab is self._preview_tab:
             self._preview_tab.refresh()
         elif tab is self._xml_tab:
-            self._xml_tab.refresh_from_model()
+            # Solo actualizar el editor si el contenido externo ha cambiado
+            if self._xml_tab.editor.toPlainText() != self.theme_model.to_xml():
+                self._xml_tab.refresh_from_model()
         elif tab is self._set_tab:
             if not self._ask_update_theme_set():
                 return  # no cambiar de pestaña realmente
             self._set_tab._refresh_list()
 
+        # Actualizar el estado de los botones Undo/Redo y guardar
+        self._update_undo_redo_state()
+        self._update_save_action_state()
+
     def _on_model_from_xml(self):
+        if self.theme_model is None:
+            self._editing_system_from_set = None
+            self._theme_set_modified = False
+            self._sys_lbl.setText("")
+            self._name_edit.setText("")
+            self._builder_tab.refresh_views()
+            self._update_actions_state()
+            self._update_undo_redo_state()
+            return
+
+        # Código existente (cuando hay modelo)
         self._editing_system_from_set = None
         self._theme_set_modified = False
         self._sys_lbl.setText("")
         self._name_edit.setText(self.theme_model.name)
         self._builder_tab.refresh_views()
+        self._update_actions_state()  # Habilitar guardado
+        self._update_undo_redo_state()  # Conectar detección de habilitar "Deshacer" y "Rehacer"
 
     def _load_system_in_builder(self, model: ThemeModel, sys_name: str):
         """Carga el modelo de un sistema del ThemeSet en el builder."""
         # Guardar el modelo actual
         self.theme_model = model
+        self._update_actions_state()  # Habilitar guardado
         self._active_system = sys_name
         self._editing_system_from_set = sys_name
         self._theme_set_modified = False
@@ -3360,10 +3971,20 @@ class MainWindow(QMainWindow):
         self._preview_tab.set_context(sys_name)
         self._preview_tab.refresh()  # 🔁 Refrescar vista previa
 
+        # Resetear pila de cambios
+        self._builder_tab._undo_stack.clear()
+        self._builder_tab._undo_stack.setClean()
+
         # Cambiar a la pestaña del Editor Visual
         self._tabs.setCurrentWidget(self._builder_tab)
+        self._update_undo_redo_state()  # Conectar detección de habilitar "Deshacer" y "Rehacer"
         self.statusBar().showMessage(
             f"Editando sistema: {sys_name} — usa 'Ctrl+S' o el botón 'Guardar en ThemeSet' para actualizar.", 5000)
+
+        # Resetear bandera opción "Guardar"
+        self._saved_model_xml = self.theme_model.to_xml()
+        self._changes_unsaved = False
+        self._update_save_action_state()
 
     # ------------------------------------------------------------------
 
@@ -3419,6 +4040,7 @@ class MainWindow(QMainWindow):
             original_model = self._theme_set.systems.get(self._editing_system_from_set)
             if original_model:
                 self.theme_model = original_model
+                self._update_actions_state()  # Habilitar guardado
                 # Actualizar todas las pestañas
                 self._xml_tab.theme_model = self.theme_model
                 self._xml_tab.refresh_from_model()
@@ -3434,10 +4056,36 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _on_current_model_changed(self):
+        """Se llama cuando el modelo cambia por edición visual o XML."""
         if self._editing_system_from_set is not None:
             self._theme_set_modified = True
-            # Opcional: cambiar color de algún indicador
             self._sys_lbl.setStyleSheet("color:#ffaa00; padding:0 8px;")
+        # Actualizar flag de cambios sin guardar
+        self._update_unsaved_flag()
+
+    def _has_xml_pending_changes(self) -> bool:
+        if not self.theme_model:
+            return False
+        if self._xml_tab.editor.document().isModified():
+            return self._xml_tab.editor.toPlainText() != self.theme_model.to_xml()
+        return False
+
+    def _update_unsaved_flag(self):
+        if not self.theme_model:
+            self._changes_unsaved = False
+        else:
+            # Cambios en el editor visual: la pila del builder no está limpia
+            visual_changes = not self._builder_tab._undo_stack.isClean()
+            # Cambios en el editor XML (texto modificado y diferente al modelo)
+            xml_modified = self._xml_tab.editor.document().isModified()
+            xml_differs = False
+            if xml_modified:
+                # Solo comparar si realmente hay cambios pendientes (evitar comparar si no es necesario)
+                current_xml = self._xml_tab.editor.toPlainText()
+                model_xml = self.theme_model.to_xml() if self.theme_model else ""
+                xml_differs = (current_xml != model_xml)
+            self._changes_unsaved = visual_changes or (xml_modified and xml_differs)
+        self._update_save_action_state()
 
     # ------------------------------------------------------------------
     def _save_current_to_theme_set(self):
@@ -3453,26 +4101,147 @@ class MainWindow(QMainWindow):
         self._set_tab._refresh_list()
 
 
+#---------------------------------------------------------------------------
+# Splashscreen
+#---------------------------------------------------------------------------
+class SplashScreen(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setStyleSheet("background-color: #2d2d2d; border-radius: 15px;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        # --- LOGO ---
+        logo_path = resource_path("egbtheme-creator.png")
+        logo_pix = QPixmap(logo_path)
+        if not logo_pix.isNull():
+            logo_pix = logo_pix.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo_label = QLabel()
+            logo_label.setPixmap(logo_pix)
+            logo_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(logo_label)
+        else:
+            title_label = QLabel("egbtheme-creator")
+            title_label.setStyleSheet("font-size: 24px; font-weight: bold; color: white;")
+            title_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(title_label)
+
+        # --- NOMBRE DEL SOFTWARE (siempre visible debajo del logo) ---
+        software_name = QLabel("egbtheme-creator")
+        software_name.setAlignment(Qt.AlignCenter)
+        software_name.setStyleSheet("font-size: 20px; font-weight: bold; color: white; margin-top: 10px;")
+        layout.addWidget(software_name)
+
+        # --- VERSIÓN (opcional) ---
+        version_label = QLabel(f"Versión {APP_VERSION}")
+        version_label.setAlignment(Qt.AlignCenter)
+        version_label.setStyleSheet("font-size: 12px; color: #aaaaaa; margin-bottom: 15px;")
+        layout.addWidget(version_label)
+
+        # --- ESTADO ---
+        self.status_label = QLabel("Iniciando...")
+        self.status_label.setStyleSheet("color: #cccccc; font-size: 14px; padding: 10px;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        # --- BARRA DE PROGRESO ---
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #555;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #1e1e1e;
+                color: white;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #1565C0;
+                border-radius: 5px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        self.setFixedSize(450, 550)
+
+    def update_progress(self, value, message):
+        self.progress_bar.setValue(value)
+        self.status_label.setText(message)
+        QApplication.processEvents()
+
+
 # ---------------------------------------------------------------------------
 def run_app():
-    app = QApplication(sys.argv)
+    # Usar nuestra subclase que captura excepciones en eventos Qt
+    app = ExceptionAwareApplication(sys.argv)
+
+    # Crear el traductor
+    translator = QTranslator(app)
+
+    # Cargar la traducción de Qt para el idioma del sistema
+    # Qt ya incluye archivos .qm para muchos idiomas
+    translator.load("qt_es", QLibraryInfo.path(QLibraryInfo.TranslationsPath))
+
+    # Instalar el traductor en la aplicación
+    app.installTranslator(translator)
+
+    # Instalar hooks globales (importante después de crear app)
+    install_global_hooks()
 
     # Establecer el icono de la aplicación (aparecerá en la barra de tareas y en la ventana)
     icon_path = resource_path("es_theme_editor.ico")
     if os.path.isfile(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    w = MainWindow()
-    w.show()
+    # Crear y mostrar el splash
+    splash = SplashScreen()
+    splash.show()
+    app.processEvents()
 
-    # COMPROBACIÓN AUTOMÁTICA ACTUALIZACIÓN
-    QTimer.singleShot(
-        1000,  # 2 segundos después de abrir la ventana
-        lambda: comprobar_actualizaciones(w, show_if_no_update=False, app_version=APP_VERSION, updater_path=resource_path("updater.exe"))
-    )
+    # Definir los pasos de carga
+    steps = [
+        (10, "Cargando módulos..."),
+        (30, "Inicializando editor XML..."),
+        (50, "Preparando editor visual..."),
+        (70, "Cargando recursos gráficos..."),
+        (90, "Verificando actualizaciones..."),
+        (100, "¡Listo! Abriendo aplicación..."),
+    ]
+    step_index = 0
 
-    # Mostrar novedades si corresponde
-    show_changelog_if_new(app_version=APP_VERSION, changelog_path=resource_path("Changelog.md"))
+    def advance_loading():
+        nonlocal step_index
+        if step_index < len(steps):
+            value, msg = steps[step_index]
+            splash.update_progress(value, msg)
+            step_index += 1
+            QTimer.singleShot(400, advance_loading)
+        else:
+            w = MainWindow()
+            splash.close()
+            w.show()
+
+            # Activar logger de registro de errores
+            logger = setup_logger()
+            logger.info("Aplicación iniciada")
+
+            # COMPROBACIÓN AUTOMÁTICA ACTUALIZACIÓN
+            QTimer.singleShot(
+                1000,  # 2 segundos después de abrir la ventana
+                lambda: comprobar_actualizaciones(w, show_if_no_update=False, app_version=APP_VERSION,
+                                                  updater_path=resource_path("updater.exe"))
+            )
+
+            # Mostrar novedades si corresponde
+            logger.debug(f"Llamando a show_changelog_if_new con ruta {resource_path('Changelog.md')}")
+            show_changelog_if_new(app_version=APP_VERSION, changelog_path=resource_path("Changelog.md"))
+
+    QTimer.singleShot(100, advance_loading)
 
     sys.exit(app.exec())
 

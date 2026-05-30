@@ -9,18 +9,58 @@ from typing import List, Dict, Optional
 # ---------------------------------------------------------------------------
 # Modelo de datos compatible con Batocera/EmulationStation
 # ---------------------------------------------------------------------------
+class XmlNode:
+    """Nodo genérico que representa cualquier elemento XML."""
+    def __init__(self, tag: str, attrib: Dict[str, str] = None, text: str = ""):
+        self.tag = tag
+        self.attrib = attrib or {}
+        self.text = text
+        self.children: List['XmlNode'] = []
 
-class ThemeElement:
+    def find_child(self, tag: str) -> Optional['XmlNode']:
+        for c in self.children:
+            if c.tag == tag:
+                return c
+        return None
+
+    def to_xml_element(self) -> ET.Element:
+        elem = ET.Element(self.tag, self.attrib)
+        if self.text:
+            elem.text = self.text
+        for child in self.children:
+            elem.append(child.to_xml_element())
+        return elem
+
+    def to_dict(self) -> Dict:
+        """Convierte el nodo y sus hijos a un diccionario serializable."""
+        return {
+            "tag": self.tag,
+            "attrib": self.attrib.copy(),
+            "text": self.text,
+            "children": [child.to_dict() for child in self.children]
+        }
+
+    @staticmethod
+    def from_dict(d: Dict) -> 'XmlNode':
+        node = XmlNode(d["tag"], d.get("attrib", {}), d.get("text", ""))
+        for child_data in d.get("children", []):
+            node.children.append(XmlNode.from_dict(child_data))
+        return node
+
+
+class ThemeElement(XmlNode):
     """Un elemento dentro de una vista: image, text, video, rating, etc."""
 
     TYPES = ["image", "text", "video", "rating", "datetime", "sound",
-             "helpsystem", "container", "ninepatch", "textlist", "gamecarousel"]
+             "helpsystem", "container", "ninepatch", "textlist", "gamecarousel",
+             "carousel", "imagegrid", "gridtile", "menuText", "menuGroup",
+             "batteryIndicator", "controllerActivity"]
 
     VIEW_ALLOWED_TYPES = {
         "system": ["carousel", "image", "video", "helpsystem", "text"],
         "basic": ["image", "helpsystem", "text", "textlist"],
         "detailed": ["image", "video", "datetime", "helpsystem", "text", "textlist", "rating"],
-        "gamecarousel": ["image", "video", "helpsystem", "datetime", "rating", "text", "textlist"],  # vista tipo carrusel de juegos
+        "gamecarousel": ["image", "video", "gamecarousel", "helpsystem", "datetime", "rating", "text", "textlist"],  # vista tipo carrusel de juegos
         "grid": ["image", "imagegrid", "gridtile", "datetime", "helpsystem", "ninepatch", "rating", "text"],
         "video": ["image", "text", "textlist", "video", "rating", "datetime", "helpsystem"], # deprecado pero compatible
         # Para customView se calculará a partir de la vista de la que hereda
@@ -60,56 +100,133 @@ class ThemeElement:
             "zIndex", "visible"
         ],
         "carousel": [
-            "pos", "size", "origin", "color", "colorEnd", "type", "logoSize",
-            "maxLogoCount", "logoPos", "logoAlignment", "logoScaleUp", "zIndex", "visible"
+            "pos", "size", "origin", "type", "defaultTransition", "logoSize", "logoScale", "logoRotation",
+            "logoRotationOrigin", "logoAlignment", "maxLogoCount", "color", "colorEnd",
+            "zIndex", "visible"
         ],
         "gamecarousel": [
-            "pos", "size", "origin", "color", "colorEnd", "imageSource", "logoScale", "logoSize", "logoRotation",
-            "logoRotationOrigin", "logoAlignment", "maxLogoCount", "scrollSound", "zIndex", "visible"
+            "pos", "size", "origin", "type", "logoSize", "logoScale", "logoRotation",
+            "logoRotationOrigin", "logoAlignment", "maxLogoCount", "imageSource",
+            "scrollSound", "color", "colorEnd", "zIndex", "visible"
         ],
     }
 
-    def __init__(self, name: str = "", element_type: str = "image",
-                 extra: bool = False, properties: Optional[Dict[str, List[ConditionalValue]]] = None):
-        self.name = name or ("e_" + str(uuid.uuid4())[:6])
-        self.element_type = element_type
+    def __init__(self, tag: str = "image", name: str = "", extra: bool = False,
+                 properties: Optional[Dict[str, List['ConditionalValue']]] = None):
+        # Inicializar el nodo XML con la etiqueta adecuada
+        attrib = {}
+        if name:
+            attrib["name"] = name
+        if extra:
+            attrib["extra"] = "true"
+        super().__init__(tag, attrib)
+        self.element_type = tag   # alias
+        self.name = name
         self.extra = extra
-        self.properties: Dict[str, List[ConditionalValue]] = properties or {}
+
+        # Si se proporcionan propiedades antiguas (plano), las convertimos a hijos hoja
+        if properties:
+            for prop_name, cv_list in properties.items():
+                for cv in cv_list:
+                    child = XmlNode(prop_name, text=cv.value)
+                    if cv.condition:
+                        child.attrib["if"] = cv.condition
+                    self.children.append(child)
 
     def get_base_value(self, prop_name: str) -> str:
-        """Devuelve el valor de la propiedad sin condición (fallback)"""
-        values = self.properties.get(prop_name, [])
-        for cv in values:
-            if cv.condition is None:
-                return cv.value
+        """Devuelve el valor de la propiedad sin condición (fallback)."""
+        for child in self.children:
+            if child.tag == prop_name and not child.children and "if" not in child.attrib:
+                return child.text
         return ""
 
     def set_base_value(self, prop_name: str, new_value: str):
         """Establece o actualiza el valor sin condición. Mantiene los condicionales."""
-        values = self.properties.get(prop_name, [])
-        # Buscar si ya existe un valor sin condición
-        for i, cv in enumerate(values):
-            if cv.condition is None:
-                values[i] = ConditionalValue(new_value, None)
+        # Buscar si ya existe un hijo hoja sin condición
+        for child in self.children:
+            if child.tag == prop_name and not child.children and "if" not in child.attrib:
+                child.text = new_value
                 return
-        # Si no existe, lo añadimos al principio
-        values.insert(0, ConditionalValue(new_value, None))
-        self.properties[prop_name] = values
+        # No existe, lo añadimos
+        new_child = XmlNode(prop_name, text=new_value)
+        self.children.append(new_child)
 
     def get_resolved_value(self, prop_name: str, context: Dict[str, str]) -> str:
         """Evalúa las condiciones y devuelve el primer valor que coincide o el base."""
-        values = self.properties.get(prop_name, [])
-        for cv in values:
-            if cv.condition is None:
-                return cv.value
-            if self._evaluate_condition(cv.condition, context):
-                return cv.value
+        for child in self.children:
+            if child.tag != prop_name:
+                continue
+            condition = child.attrib.get("if")
+            if condition is None:
+                return child.text
+            if self._evaluate_condition(condition, context):
+                return child.text
         return ""
+
+    def get_resolved_values(self, prop_name: str, context: Dict[str, str]) -> List[str]:
+        """Devuelve una lista de valores resueltos (variables expandidas) para la propiedad prop_name,
+        en el orden de aparición de los nodos hijos, evaluando condiciones."""
+        values = []
+        for child in self.children:
+            if child.tag != prop_name:
+                continue
+            condition = child.attrib.get("if")
+            if condition is None or self._evaluate_condition(condition, context):
+                # Resolver variables dentro del texto
+                resolver = ThemeVariableResolver(context, context.get("system.theme", ""))
+                resolved = resolver.resolve(child.text)
+                values.append(resolved)
+        return values
+
+    @property
+    def properties(self) -> Dict[str, List[ConditionalValue]]:
+        """Compatibilidad: devuelve los hijos hoja como propiedades."""
+        props = {}
+        for child in self.children:
+            if not child.children:  # es hoja
+                cv = ConditionalValue(child.text, child.attrib.get("if"))
+                props.setdefault(child.tag, []).append(cv)
+        return props
+
+    def suggested_props(self) -> List[str]:
+        return self.COMMON_PROPS.get(self.element_type, ["pos", "size"])
+
+    # to_dict y from_dict se pueden mantener pero usando la nueva estructura
+    def to_dict(self) -> Dict:
+        children_data = []
+        for child in self.children:
+            children_data.append({
+                "tag": child.tag,
+                "attrib": child.attrib,
+                "text": child.text,
+                "children": [c.to_dict() for c in child.children]  # recursivo
+            })
+        return {
+            "name": self.name,
+            "element_type": self.element_type,
+            "extra": self.extra,
+            "attrib": self.attrib,
+            "children": children_data,
+        }
+
+    @staticmethod
+    def from_dict(d: Dict) -> 'ThemeElement':
+        elem = ThemeElement(
+            tag=d.get("element_type", "image"),
+            name=d.get("name", ""),
+            extra=d.get("extra", False)
+        )
+        # Recuperar los hijos guardados recursivamente
+        for child_data in d.get("children", []):
+            child = XmlNode(child_data["tag"], child_data.get("attrib", {}), child_data.get("text", ""))
+            for sub in child_data.get("children", []):
+                child.children.append(XmlNode.from_dict(sub))
+            elem.children.append(child)
+        return elem
+
+    # Método estático de evaluación de condiciones (copiado del original)
     @staticmethod
     def _evaluate_condition(cond: str, context: Dict[str, str]) -> bool:
-        """Evalúa una condición simple (solo ==, ||, etc.) - Implementación básica."""
-        # Este es un ejemplo muy simplificado. Para un uso real, necesitarías un parser.
-        # Aquí asumimos condiciones como "{system.theme} == 'neogeo'"
         import re
         pattern = r"\{([^}]+)\}\s*==\s*'([^']+)'"
         match = re.search(pattern, cond)
@@ -117,43 +234,25 @@ class ThemeElement:
             var = match.group(1)
             expected = match.group(2)
             return context.get(var, "") == expected
-        # Soporte para OR (muy básico)
         if "||" in cond:
             parts = cond.split("||")
             return any(ThemeElement._evaluate_condition(p.strip(), context) for p in parts)
         return False
 
-    def suggested_props(self) -> List[str]:
-        return self.COMMON_PROPS.get(self.element_type, ["pos", "size"])
+    # Dentro de la clase ThemeElement
+    def get_property_nodes(self, prop_name: str) -> list:
+        """Devuelve todos los nodos hijos que tienen la etiqueta prop_name."""
+        return [child for child in self.children if child.tag == prop_name]
 
-    def to_dict(self) -> Dict:
-        props = {}
-        for k, vlist in self.properties.items():
-            props[k] = [cv.to_dict() for cv in vlist]
-        return {
-            "name": self.name,
-            "element_type": self.element_type,
-            "extra": self.extra,
-            "properties": props,
-        }
-
-    @staticmethod
-    def from_dict(d: Dict) -> 'ThemeElement':
-        props = {}
-        for k, vlist in d.get("properties", {}).items():
-            props[k] = [ConditionalValue.from_dict(cv) for cv in vlist]
-        return ThemeElement(
-            name=d.get("name", ""),
-            element_type=d.get("element_type", "image"),
-            extra=bool(d.get("extra", False)),
-            properties=props,
-        )
+    def delete_property_nodes(self, prop_name: str):
+        """Elimina todos los nodos hijos con la etiqueta prop_name."""
+        self.children = [child for child in self.children if child.tag != prop_name]
 
 
 class ThemeView:
     """Una vista de Batocera: system, basic, detailed, video, grid o customView."""
 
-    STANDARD_VIEWS = ["system", "basic", "gamecarousel", "detailed", "video", "grid", "customView"]
+    STANDARD_VIEWS = ["system", "basic", "detailed", "gamecarousel", "grid"]
 
     def __init__(self, name: str = "system", inherits: str = "",
                  is_custom: bool = False):
@@ -188,11 +287,14 @@ class ThemeModel:
         self.name = name
         self.format_version = format_version
         self.views: List[ThemeView] = []
-        self.includes: List[str] = []
-        self.subsets: Dict[str, List[Dict]] = {}
+        self.includes: List[Dict[str, str]] = []  # cada dict: {"path": "...", "ifArch": "...", "lang": "..."}
+        self.variables: Dict[str, str] = {}
+        self.subsets: List[XmlNode] = []  # nodos <subset>
+        self.root_attrib: Dict[str, str] = {}  # atributos de la raíz <theme>
         self.raw_xml: str = ""
+        self.xml_declaration: bool = False
 
-    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
     def get_view(self, view_name: str) -> Optional[ThemeView]:
         for v in self.views:
             if v.name == view_name:
@@ -212,32 +314,43 @@ class ThemeModel:
 
     # ------------------------------------------------------------------
     def to_xml(self) -> str:
-        root = ET.Element("theme")
+        root = ET.Element("theme", self.root_attrib)
         ET.SubElement(root, "formatVersion").text = str(self.format_version)
 
-        for inc in self.includes:
-            ET.SubElement(root, "include").text = inc
+        # Variables
+        if self.variables:
+            vars_elem = ET.SubElement(root, "variables")
+            for k, v in self.variables.items():
+                ET.SubElement(vars_elem, k).text = v
 
+        # Includes (con atributos ifArch, lang, etc.)
+        for inc in self.includes:
+            attrib = {}
+            if "ifArch" in inc:
+                attrib["ifArch"] = inc["ifArch"]
+            if "lang" in inc:
+                attrib["lang"] = inc["lang"]
+            # Puedes añadir más según necesites
+            inc_elem = ET.SubElement(root, "include", attrib)
+            inc_elem.text = inc.get("path", "")
+
+        # Subsets
+        for subset_node in self.subsets:
+            root.append(subset_node.to_xml_element())
+
+        # Vistas
         for view in self.views:
             if view.is_custom:
-                attrib: Dict[str, str] = {"name": view.name}
+                view_elem = ET.SubElement(root, "customView", attrib={"name": view.name})
                 if view.inherits:
-                    attrib["inherits"] = view.inherits
-                view_el = ET.SubElement(root, "customView", attrib=attrib)
+                    view_elem.set("inherits", view.inherits)
             else:
-                view_el = ET.SubElement(root, "view", attrib={"name": view.name})
+                view_elem = ET.SubElement(root, "view", attrib={"name": view.name})
             for elem in view.elements:
-                attrib: Dict[str, str] = {"name": elem.name}
-                if elem.extra:
-                    attrib["extra"] = "true"
-                elem_el = ET.SubElement(view_el, elem.element_type, attrib=attrib)
-                for prop_name, cv_list in elem.properties.items():
-                    for cv in cv_list:
-                        prop_el = ET.SubElement(elem_el, prop_name)
-                        if cv.condition:
-                            prop_el.set("if", cv.condition)
-                        prop_el.text = cv.value
+                # Aquí usamos el método to_xml_element de ThemeElement (hereda de XmlNode)
+                view_elem.append(elem.to_xml_element())
 
+        # Generar string bonito
         raw = ET.tostring(root, encoding="unicode")
         try:
             dom = minidom.parseString(raw)
@@ -245,10 +358,22 @@ class ThemeModel:
             lines = pretty.split("\n")
             if lines[0].startswith("<?xml"):
                 pretty = "\n".join(lines[1:])
-            self.raw_xml = pretty
+            result = pretty
         except Exception:
-            self.raw_xml = raw
-        return self.raw_xml
+            result = raw
+
+        if self.xml_declaration:
+            result = '<?xml version="1.0" encoding="UTF-8"?>\n\n' + result
+        self.raw_xml = result
+        return result
+
+    @staticmethod
+    def _parse_node_to_xmlnode(elem: ET.Element) -> XmlNode:
+        """Convierte recursivamente un elemento XML en un XmlNode."""
+        node = XmlNode(elem.tag, dict(elem.attrib), elem.text or "")
+        for child in elem:
+            node.children.append(ThemeModel._parse_node_to_xmlnode(child))
+        return node
 
     @staticmethod
     def from_xml(xml_str: str) -> Optional['ThemeModel']:
@@ -257,52 +382,70 @@ class ThemeModel:
         except ET.ParseError:
             return None
 
-        t = ThemeModel()
+        model = ThemeModel()
+        model.raw_xml = xml_str
+        # Detectar declaración XML
+        if xml_str.lstrip().startswith('<?xml'):
+            model.xml_declaration = True
+        model.root_attrib = dict(root.attrib)
+
+        # formatVersion
         fv = root.find("formatVersion")
         if fv is not None and fv.text:
             try:
-                t.format_version = int(fv.text.strip())
+                model.format_version = int(fv.text.strip())
             except ValueError:
                 pass
 
-        for inc in root.findall("include"):
-            if inc.text:
-                t.includes.append(inc.text.strip())
+        # Variables
+        vars_elem = root.find("variables")
+        if vars_elem is not None:
+            for child in vars_elem:
+                if child.text:
+                    model.variables[child.tag] = child.text.strip()
 
-        def _parse_view_el(view_el, is_custom=False):
+        # Includes
+        for inc in root.findall("include"):
+            inc_data = {"path": inc.text.strip() if inc.text else ""}
+            if "ifArch" in inc.attrib:
+                inc_data["ifArch"] = inc.attrib["ifArch"]
+            if "lang" in inc.attrib:
+                inc_data["lang"] = inc.attrib["lang"]
+            model.includes.append(inc_data)
+
+        # Subsets
+        for subset_el in root.findall("subset"):
+            subset_node = XmlNode("subset", dict(subset_el.attrib))
+            for inc_el in subset_el.findall("include"):
+                inc_node = XmlNode("include", dict(inc_el.attrib), inc_el.text or "")
+                subset_node.children.append(inc_node)
+            model.subsets.append(subset_node)
+
+        # Views
+        def parse_view(view_el, is_custom):
             view = ThemeView(
                 name=view_el.attrib.get("name", "system"),
                 inherits=view_el.attrib.get("inherits", ""),
-                is_custom=is_custom,
+                is_custom=is_custom
             )
-
-            for child in view_el:
+            for child_el in view_el:
                 elem = ThemeElement(
-                    name=child.attrib.get("name", ""),
-                    element_type=child.tag,
-                    extra=(child.attrib.get("extra", "false").lower() == "true"),
-                    properties={},
+                    tag=child_el.tag,
+                    name=child_el.attrib.get("name", ""),
+                    extra=child_el.attrib.get("extra", "false").lower() == "true"
                 )
-                # Procesar cada subetiqueta (path, pos, size, etc.)
-                for sub in child:
-                    prop_name = sub.tag
-                    prop_val = sub.text or ""
-                    condition = sub.attrib.get("if", None)
-                    cv = ConditionalValue(prop_val, condition)
-                    if prop_name not in elem.properties:
-                        elem.properties[prop_name] = []
-                    elem.properties[prop_name].append(cv)
+                # Añadir todos los hijos (propiedades y subelementos) de forma recursiva
+                for sub_el in child_el:
+                    elem.children.append(ThemeModel._parse_node_to_xmlnode(sub_el))
                 view.elements.append(elem)
             return view
 
         for view_el in root.findall("view"):
-            t.views.append(_parse_view_el(view_el, is_custom=False))
-
+            model.views.append(parse_view(view_el, is_custom=False))
         for view_el in root.findall("customView"):
-            t.views.append(_parse_view_el(view_el, is_custom=True))
+            model.views.append(parse_view(view_el, is_custom=True))
 
-        t.raw_xml = xml_str
-        return t
+        return model
 
 
 # ---------------------------------------------------------------------------
